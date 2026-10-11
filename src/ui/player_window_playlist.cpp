@@ -467,7 +467,7 @@ std::vector<skin::SkinLayer> PlaylistLayers(const skin::PlaylistSkin& layout,
     std::vector<skin::SkinLayer> layers;
     if (!IsRectEmpty(&geometry.toolbar)) layers.push_back({&layout.title, geometry.toolbar, 1});
     if (!IsRectEmpty(&geometry.list)) layers.push_back({nullptr, geometry.list, 2});
-    if (layout.close.image) layers.push_back({&layout.close, geometry.close, 3});
+    if (!IsRectEmpty(&geometry.close)) layers.push_back({&layout.close, geometry.close, 3});
     return layers;
 }
 
@@ -475,13 +475,13 @@ PlaylistScrollbarMetrics ResolvePlaylistScrollbarMetrics(
     const PlaylistGeometry& geometry, const skin::PlaylistSkin& layout,
     size_t item_count, size_t page_size, size_t position) noexcept {
     const int button_extent = std::max(
-        1, layout.scrollbar_buttons.image ? static_cast<int>(layout.scrollbar_buttons.size.cy / 2) : 13);
+        1, layout.HasSkinnedScrollbar() ? static_cast<int>(layout.scrollbar_buttons.size.cy / 2) : 13);
     const int thumb_extent = std::max(
-        1, layout.scrollbar_thumb.image ? static_cast<int>(layout.scrollbar_thumb.size.cy) : 13);
+        1, layout.HasSkinnedScrollbar() ? static_cast<int>(layout.scrollbar_thumb.size.cy) : 13);
     return MakePlaylistScrollbarMetrics(
         geometry.scrollbar.top, geometry.scrollbar.bottom,
         button_extent, thumb_extent,
-        layout.scrollbar_thumb.image ? layout.scrollbar_thumb_resize_center : 1,
+        layout.HasSkinnedScrollbar() ? layout.scrollbar_thumb_resize_center : 1,
         item_count, page_size, position);
 }
 
@@ -1557,6 +1557,19 @@ LRESULT PlayerWindow::HandlePlaylistControlMessage(HWND control, UINT message,
     const bool tracks = identifier == kPlaylistTrackId;
     const bool list_control = catalogue || tracks || identifier == kPlaylistTreeId;
     const bool close_button = identifier == static_cast<int>(kCmdShowPlaylist);
+    if (close_button) {
+        if (message == WM_NCDESTROY) native_skin_buttons_.erase(control);
+        else {
+            const auto previous = native_skin_buttons_[control];
+            auto& button = NativeSkinButton(control);
+            bool invoke{};
+            if (skin::HandleSkinButtonInput(control, button, message, wparam, lparam, invoke)) {
+                if (previous != button) InvalidateRect(control, nullptr, TRUE);
+                if (invoke) TogglePlaylistWindow();
+                return 0;
+            }
+        }
+    }
     const auto forward_point = [&](UINT forwarded) {
         POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
         MapWindowPoints(control, parent, &point, 1);
@@ -1766,7 +1779,15 @@ LRESULT PlayerWindow::HandlePlaylistControlMessage(HWND control, UINT message,
         return 1;
     case WM_PAINT: {
         PAINTSTRUCT paint{};
-        BeginPaint(control, &paint);
+        const HDC dc = BeginPaint(control, &paint);
+        if (close_button) {
+            const int saved = SaveDC(dc);
+            POINT origin{};
+            MapWindowPoints(control, parent, &origin, 1);
+            SetViewportOrgEx(dc, -origin.x, -origin.y, nullptr);
+            PaintPlaylist(dc);
+            if (saved) RestoreDC(dc, saved);
+        }
         EndPaint(control, &paint);
         return 0;
     }
@@ -3199,7 +3220,7 @@ void PlayerWindow::RemoveToolTipTools(HWND owner) {
             ++item;
             continue;
         }
-        TOOLINFOW tool{sizeof(tool)};
+        TOOLINFOW tool{TTTOOLINFOW_V2_SIZE};
         tool.hwnd = item->owner;
         if (item->control) {
             tool.uFlags = TTF_IDISHWND;
@@ -3219,7 +3240,9 @@ void PlayerWindow::AddToolTipTool(HWND owner, UINT_PTR identifier,
     if (!target) target = tooltip_;
     if (!target || !owner || bounds.right <= bounds.left ||
         bounds.bottom <= bounds.top) return;
-    TOOLINFOW tool{sizeof(tool)};
+    // V2 is accepted by both ComCtl32 v5 (classic) and v6. The current SDK's
+    // larger structure makes classic tooltips reject the registration.
+    TOOLINFOW tool{TTTOOLINFOW_V2_SIZE};
     // FUN_004085C6 leaves explicit-rectangle tools at flags zero. The main
     // window message path supplies the framework-equivalent TTM_RELAYEVENT.
     tool.uFlags = 0;
@@ -3358,7 +3381,7 @@ void PlayerWindow::AddToolTipControl(HWND control, UINT_PTR identifier) {
     const HWND owner = GetParent(control);
     const HWND target = tooltip_;
     if (!target) return;
-    TOOLINFOW tool{sizeof(tool)};
+    TOOLINFOW tool{TTTOOLINFOW_V2_SIZE};
     // FUN_004085C6 sees a zero explicit uId, changes hwnd to the child parent,
     // stores the child HWND in uId and ORs flag 1 (TTF_IDISHWND).
     // The original framework relays child mouse messages through its message
@@ -3386,7 +3409,7 @@ void PlayerWindow::AddPlaylistToolTipControl(HWND control,
         tooltip_tools_.push_back({target, playlist_window_, control,
                                   identifier, std::move(value)});
         auto item = std::prev(tooltip_tools_.end());
-        TOOLINFOW tool{sizeof(tool)};
+        TOOLINFOW tool{TTTOOLINFOW_V2_SIZE};
         tool.uFlags = TTF_IDISHWND;
         tool.hwnd = playlist_window_;
         tool.uId = reinterpret_cast<UINT_PTR>(control);
@@ -3439,7 +3462,10 @@ void PlayerWindow::UpdateMainToolRects() {
         else if (element.name == L"volume") identifier = 0x7ddb;
         else if (element.name == L"icon") identifier = 0x7dd8;
         if (identifier && registered.insert(identifier).second)
-            AddToolTipTool(window_, identifier, element.bounds);
+            AddToolTipTool(window_, identifier, element.name == L"icon"
+                ? skin::NativeSkinIconBounds(CurrentSkinIcon(), element.bounds)
+                : (element.name == L"play" || element.name == L"pause")
+                    ? MainSkinButtonBounds(element.name) : element.bounds);
     }
 }
 
@@ -3498,8 +3524,7 @@ void PlayerWindow::UpdatePlaylistToolRects() {
             AddToolTipTool(playlist_window_, identifier, bounds);
         }
     };
-    if (skin_->Playlist().close.image)
-        add_control(kPlaylistToolFirst + 7, kCmdShowPlaylist, metrics.close);
+    add_control(kPlaylistToolFirst + 7, kCmdShowPlaylist, metrics.close);
     UpdatePlaylistItemTipRects();
     constexpr int count = 7;
     for (int index = 0; index < count && metrics.toolbar.right > metrics.toolbar.left; ++index) {
@@ -3610,7 +3635,7 @@ void PlayerWindow::UpdatePlaylistItemTipRects() {
                 ++item;
                 continue;
             }
-            TOOLINFOW tool{sizeof(tool)};
+            TOOLINFOW tool{TTTOOLINFOW_V2_SIZE};
             tool.hwnd = item->owner;
             tool.uId = item->identifier;
             if (item->tooltip && IsWindow(item->tooltip)) {
@@ -3853,7 +3878,7 @@ std::optional<size_t> PlayerWindow::PlaylistToolbarButtonAt(POINT point) const {
         settings_.playlist.split_on_lists, client.right, client.bottom,
         VisiblePlaylistTrackCount(), PlaylistRowHeight(), playlists_.Size(), settings_.playlist.library_mode);
     if (!PtInRect(&metrics.toolbar, point)) return std::nullopt;
-    if (skin_->Playlist().toolbar_items) {
+    if (skin_->Playlist().toolbar_items || !skin_->Playlist().toolbar.image) {
         for (size_t index = 0; index < 7; ++index) {
             const RECT item = PlaylistToolbarItemBounds(skin_->Playlist(), metrics.toolbar, index);
             if (PtInRect(&item, point)) return index;
@@ -4318,6 +4343,21 @@ void PlayerWindow::PaintPlaylist(HDC dc) const {
             DrawHorizontalGradient(canvas, metrics.splitter,
                 settings_.playlist.text_color,
                 settings_.playlist.background_color);
+            // 5.7.9's generated splitter also paints the top/bottom edge
+            // and a five-row arrow in Color_Text (not gradient pixels).
+            const RECT& bar = metrics.splitter;
+            const HBRUSH brush = CreateSolidBrush(settings_.playlist.text_color);
+            const RECT top{bar.left, bar.top, bar.right, bar.top + 1};
+            const RECT bottom{bar.left, bar.bottom - 1, bar.right, bar.bottom};
+            FillRect(canvas, &top, brush);
+            FillRect(canvas, &bottom, brush);
+            const int center = (bar.top + bar.bottom) / 2;
+            for (int row = -2; row <= 2; ++row) {
+                const RECT arrow{bar.left + 1 + std::abs(row), center + row,
+                                 bar.right - 1, center + row + 1};
+                if (!IsRectEmpty(&arrow)) FillRect(canvas, &arrow, brush);
+            }
+            DeleteObject(brush);
         }
 
         for (int row = 0; row < metrics.visible_rows; ++row) {
@@ -4476,23 +4516,39 @@ void PlayerWindow::PaintPlaylist(HDC dc) const {
     }
     else if (!IsRectEmpty(&metrics.toolbar)) {
         const skin::SkinLayerClip clip(canvas, layers, &layout.title);
-        NONCLIENTMETRICSW ncm{sizeof(ncm)};
+        // 0047E512 renders seven 32x16 cells on a magenta bitmap, then
+        // 0047AB54 colour-keys that bitmap. Text antialiasing must happen
+        // against that key, not against the live skin's background.
+        const HDC text_dc = CreateCompatibleDC(canvas);
+        const HBITMAP text_bitmap = CreateCompatibleBitmap(canvas, 224, 16);
+        const auto old_bitmap = SelectObject(text_dc, text_bitmap);
+        const RECT text_bounds{0, 0, 224, 16};
+        const HBRUSH key_brush = CreateSolidBrush(RGB(255, 0, 255));
+        FillRect(text_dc, &text_bounds, key_brush);
+        DeleteObject(key_brush);
+        NONCLIENTMETRICSW ncm{};
+        ncm.cbSize = sizeof(ncm) - sizeof(ncm.iPaddedBorderWidth); // 0047E512: 500, also accepted on XP.
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, 0, &ncm, 0);
         const HFONT font = CreateFontIndirectW(&ncm.lfMenuFont);
-        const auto old = SelectObject(canvas, font ? font : GetStockObject(DEFAULT_GUI_FONT));
-        SetBkMode(canvas, TRANSPARENT);
+        const auto old = SelectObject(text_dc, font ? font : GetStockObject(DEFAULT_GUI_FONT));
+        SetBkMode(text_dc, TRANSPARENT);
         for (size_t index = 0; index < 7; ++index) {
             auto label = MenuPositionText(ResourceModule(), kMenuPlaylistToolbar, static_cast<UINT>(index));
-            RECT cell = PlaylistToolbarItemBounds(layout, metrics.toolbar, index);
+            RECT cell{static_cast<LONG>(index * 32), 0, static_cast<LONG>((index + 1) * 32), 16};
             RECT shadow = cell;
             OffsetRect(&shadow, 1, 1);
-            SetTextColor(canvas, GetSysColor(COLOR_BTNSHADOW));
-            DrawTextW(canvas, label.c_str(), -1, &shadow, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SetTextColor(canvas, GetSysColor(COLOR_MENUTEXT));
-            DrawTextW(canvas, label.c_str(), -1, &cell, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(text_dc, GetSysColor(COLOR_BTNSHADOW));
+            DrawTextW(text_dc, label.c_str(), -1, &shadow, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(text_dc, GetSysColor(COLOR_MENUTEXT));
+            DrawTextW(text_dc, label.c_str(), -1, &cell, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
-        SelectObject(canvas, old);
+        SelectObject(text_dc, old);
         if (font) DeleteObject(font);
+        SelectObject(text_dc, old_bitmap);
+        DeleteDC(text_dc);
+        const skin::SkinBitmap generated{skin::SkinImage(text_bitmap), {224, 16}};
+        DrawPlaylistToolbarBitmap(canvas, generated, metrics.toolbar,
+            RGB(255, 0, 255), std::nullopt, 255, &layout);
     }
 
     for (bool catalogue : {false, true}) {
@@ -4508,14 +4564,14 @@ void PlayerWindow::PaintPlaylist(HDC dc) const {
             track_count > static_cast<size_t>(
                 std::max(1, bar_geometry.page_rows))) {
             const skin::SkinLayerClip clip(canvas, layers, nullptr);
-            if (layout.scrollbar_bar.image)
+            if (layout.HasSkinnedScrollbar())
                 TileBitmap(canvas, layout.scrollbar_bar, bar_geometry.scrollbar);
             else FillRect(canvas, &bar_geometry.scrollbar, GetSysColorBrush(COLOR_SCROLLBAR));
             const auto state = ResolvePlaylistScrollbarMetrics(
                 bar_geometry, layout, track_count,
                 static_cast<size_t>(std::max(1, bar_geometry.page_rows)),
                 catalogue ? playlist_list_scroll_ : playlist_scroll_);
-            if (layout.scrollbar_buttons.image) {
+            if (layout.HasSkinnedScrollbar()) {
                 const int source_frame_width = std::max(
                     1, static_cast<int>(layout.scrollbar_buttons.size.cx / 3));
                 const int destination_width = std::min(
@@ -4547,7 +4603,7 @@ void PlayerWindow::PaintPlaylist(HDC dc) const {
                 DrawFrameControl(canvas, &down, DFC_SCROLL, DFCS_SCROLLDOWN |
                     (pressed == PlaylistScrollbarPart::line_down ? DFCS_PUSHED : 0));
             }
-            if (layout.scrollbar_thumb.image) {
+            if (layout.HasSkinnedScrollbar()) {
                 RECT thumb_bounds{bar_geometry.scrollbar.left, state.thumb_top,
                                   bar_geometry.scrollbar.right, state.thumb_bottom};
                 const int frame = PlaylistScrollbarImageFrame(
@@ -4568,8 +4624,10 @@ void PlayerWindow::PaintPlaylist(HDC dc) const {
 
     if (layout.close.image) {
         const skin::SkinLayerClip clip(canvas, layers, &layout.close);
-        const int state = playlist_close_pressed_ && playlist_close_hover_
+        int state = playlist_close_pressed_ && playlist_close_hover_
             ? 2 : (playlist_close_hover_ ? 1 : 0);
+        if (const HWND control = GetDlgItem(playlist_window_, kCmdShowPlaylist);
+            control && native_skin_buttons_.contains(control)) state = NativeSkinButton(control).Frame();
         DrawAnimatedSkinFrame(canvas, layout.close, metrics.close, state, playlist_window_);
     }
     BitBlt(dc, 0, 0, width, height, canvas, 0, 0, SRCCOPY);
@@ -4644,7 +4702,8 @@ void PlayerWindow::PreparePlaylistMenu(HMENU menu) const {
         has_selection && focused_track &&
         SupportsLegacyFreeDbQuery(*focused_track));
     EnableCommand(menu, kPlaylistDownload,
-        has_selection && focused_track);
+        has_selection && focused_track &&
+        !audio::HttpDownloadKey(focused_track->path.wstring()).empty());
     EnableCommand(menu, kPlaylistReportOnline,
         focused_network && all_selected_network);
     for (UINT command = kPlaylistRatingFirst;

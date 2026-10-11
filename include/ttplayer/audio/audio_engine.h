@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -147,6 +148,21 @@ struct PlaybackOptions {
     int sound_fade_mode{15};
     std::array<int, 4> fade_duration{300, 500, 800, 800};
     int track_fade_duration{5000};
+    // HTTP I/O runs on decoder threads; cancellation is observed during every
+    // async wait, including Open. This callback must outlive the source.
+    std::function<bool()> network_canceled;
+    int network_timeout_ms{15000};
+    int network_proxy_type{1}, network_proxy_port{};
+    std::wstring network_proxy_server, network_proxy_username, network_proxy_password;
+    bool network_cache_enabled{true};
+    std::filesystem::path network_cache_folder;
+    int network_cache_space_mb{600};
+    std::filesystem::path network_download_folder, network_download_list;
+    // Optional caller-owned network profile (no system settings are changed).
+    std::wstring network_pac_url;
+    int network_auto_detect{-1};
+    std::vector<unsigned char> network_ca_pem;
+    size_t network_live_cache_bytes{8U * 1024U * 1024U};
 };
 
 // Read-only decoded PCM boundary shared by playback and offline conversion.
@@ -340,6 +356,8 @@ private:
     std::atomic<int64_t> seek_request_ms_{-1};
     std::atomic<int64_t> pending_seek_position_ms_{-1};
     uint64_t seek_revision_{}; // guarded by mutex_; also invalidates stale ACKs
+    int64_t opening_seek_ms_{-1}; // one-shot seek after an asynchronous open
+    bool opening_paused_{}; // guarded by mutex_
     std::atomic<bool> stop_requested_{true};
     mutable std::mutex mutex_;
     HWND state_notification_window_{};

@@ -1,15 +1,14 @@
 #include <ttpcomm/base64.h>
 #include "ttplayer/skin/skin.h"
+#include "ttplayer/skin/skin_package.h"
 #include "ttplayer/settings/settings.h"
 
 #include <algorithm>
 #include <array>
-#include <comdef.h>
+#include "legacy_skin_xml.h"
 #include <cstring>
 #include <cwctype>
 #include <fstream>
-#include <msxml6.h>
-#include <regex>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -18,40 +17,12 @@
 
 namespace ttplayer::skin {
 namespace {
-struct ComScope {
-    HRESULT result{CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)};
-    ~ComScope() { if (SUCCEEDED(result)) CoUninitialize(); }
-};
-
-std::wstring Attribute(IXMLDOMNode* node, const wchar_t* name) {
-    IXMLDOMNamedNodeMap* attributes{};
-    IXMLDOMNode* attribute{};
-    if (!node || FAILED(node->get_attributes(&attributes)) || !attributes) return {};
-    attributes->getNamedItem(_bstr_t(name), &attribute);
-    attributes->Release();
-    if (!attribute) return {};
-    VARIANT value{};
-    VariantInit(&value);
-    attribute->get_nodeValue(&value);
-    attribute->Release();
-    const _variant_t managed(value, false);
-    if (managed.vt == VT_EMPTY || managed.vt == VT_NULL) return {};
-    return static_cast<const wchar_t*>(_bstr_t(managed));
+std::wstring Attribute(const LegacyXmlNode* node, const wchar_t* name) {
+    return node ? node->Attribute(name) : std::wstring{};
 }
 
-std::vector<IXMLDOMNode*> Nodes(IXMLDOMDocument* document, const wchar_t* path) {
-    std::vector<IXMLDOMNode*> result;
-    IXMLDOMNodeList* list{};
-    document->selectNodes(_bstr_t(path), &list);
-    long count{};
-    if (list) list->get_length(&count);
-    for (long i = 0; i < count; ++i) {
-        IXMLDOMNode* node{};
-        list->get_item(i, &node);
-        if (node) result.push_back(node); // caller releases each item
-    }
-    if (list) list->Release();
-    return result;
+std::vector<LegacyXmlNode*> Nodes(const LegacyXmlDocument& document, const wchar_t* path) {
+    return document.Nodes(path);
 }
 
 std::filesystem::path SkinAssetPath(const std::filesystem::path& directory,
@@ -87,146 +58,66 @@ int ParseInt(const std::wstring& value, int fallback) {
     return end != value.c_str() ? static_cast<int>(parsed) : 0;
 }
 
-unsigned int ParseAlignment(const std::wstring& value) {
-    unsigned int result{};
-    size_t first{};
-    while (first <= value.size()) {
-        const size_t separator = value.find(L'+', first);
-        const std::wstring_view token(value.data() + first,
-            (separator == std::wstring::npos ? value.size() : separator) - first);
+unsigned int ParseAlignment(std::wstring value, unsigned int initial = 0) {
+    if (value.empty()) return 0;
+    std::transform(value.begin(), value.end(), value.begin(), towlower);
+    unsigned int result = initial;
+    const auto apply = [&](std::wstring_view token) {
         if (token == L"left") result = (result & 0xf0U) | 1U;
         else if (token == L"center") result = (result & 0xf0U) | 2U;
         else if (token == L"right") result = (result & 0xf0U) | 3U;
         else if (token == L"top") result = (result & 0x0fU) | 0x10U;
         else if (token == L"vcenter") result = (result & 0x0fU) | 0x20U;
         else if (token == L"bottom") result = (result & 0x0fU) | 0x30U;
-        if (separator == std::wstring::npos) break;
-        first = separator + 1;
-    }
+    };
+    // 004AA150 splits once; text passes initial=1, images initial=0.
+    const auto split = value.find(L'+');
+    apply(std::wstring_view(value).substr(0, split));
+    if (split != std::wstring::npos) apply(std::wstring_view(value).substr(split + 1));
     return result;
 }
 
-std::wstring DecodeLegacyXml(std::span<const unsigned char> source) {
+std::wstring DecodeLegacyXml(std::span<const unsigned char> source, bool main_document = true) {
+    if (source.empty() || source.size() > LegacyXmlDocument::MaxBytes)
+        throw std::runtime_error("invalid Skin.xml length");
     std::string bytes(reinterpret_cast<const char*>(source.data()), source.size());
-    if (bytes.starts_with("\xEF\xBB\xBF")) bytes.erase(0, 3);
-    UINT code_page = CP_UTF8;
-    int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(),
-                                    static_cast<int>(bytes.size()), nullptr, 0);
-    if (count <= 0) {
-        code_page = CP_ACP;
-        count = MultiByteToWideChar(code_page, 0, bytes.data(),
-                                    static_cast<int>(bytes.size()), nullptr, 0);
-    }
+    const bool utf8_bom = bytes.starts_with("\xEF\xBB\xBF");
+    if (utf8_bom) bytes.erase(0, 3);
+    std::string declaration;
+    const auto start = bytes.find_first_not_of(" \t\r\n\v\f");
+    if (start != bytes.npos && bytes.compare(start, 5, "<?xml") == 0)
+        declaration = bytes.substr(start, bytes.find("?>", start) - start);
+    std::transform(declaration.begin(), declaration.end(), declaration.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    // 004A794C supplies CP936 for Skin.xml, irrespective of the system ACP.
+    // Sidecars use 004A73B5's automatic/declaration-selected encoding.
+    // Explicit UTF-8 and its BOM remain supported extensions for new skins.
+    UINT code_page = main_document ? 936 : CP_ACP;
+    if (utf8_bom || declaration.find("utf-8") != declaration.npos) code_page = CP_UTF8;
+    else if (declaration.find("gb2312") != declaration.npos ||
+             declaration.find("gbk") != declaration.npos) code_page = 936;
+    const int count = MultiByteToWideChar(code_page, code_page == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0,
+        bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
     if (count <= 0) throw std::runtime_error("unsupported Skin.xml encoding");
     std::wstring result(static_cast<size_t>(count), L'\0');
     MultiByteToWideChar(code_page, code_page == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0,
                         bytes.data(), static_cast<int>(bytes.size()), result.data(), count);
-    // TTPlayer's legacy XML reader accepts two defects present in the shipped
-    // skin collection: unquoted scalar attributes and adjacent quoted
-    // attributes without intervening whitespace.  Normalize both before
-    // handing the document to MSXML.  Excluding '/' keeps `value=true/>` as a
-    // self-closing tag rather than consuming its terminator into the value.
-    result = std::regex_replace(result,
-        std::wregex(L"([\"'])([A-Za-z_][A-Za-z0-9_-]*\\s*=)"),
-        L"$1 $2");
-    // Quote unquoted attribute values only while walking a tag and only when
-    // the '=' is outside an existing quoted value.  A regular expression over
-    // the whole document also sees query-string pairs inside url="..." and
-    // corrupts strings such as `?automodule=blog&blogid=62`.
-    std::wstring normalized;
-    normalized.reserve(result.size());
-    bool in_tag{};
-    wchar_t quote{};
-    for (size_t index{}; index < result.size();) {
-        const wchar_t value = result[index];
-        if (!in_tag) {
-            normalized.push_back(value);
-            if (value == L'<') in_tag = true;
-            ++index;
-            continue;
-        }
-        if (quote) {
-            normalized.push_back(value);
-            if (value == quote) quote = 0;
-            ++index;
-            continue;
-        }
-        if (value == L'\"' || value == L'\'') {
-            quote = value;
-            normalized.push_back(value);
-            ++index;
-            continue;
-        }
-        if (value == L'>') {
-            in_tag = false;
-            normalized.push_back(value);
-            ++index;
-            continue;
-        }
-        normalized.push_back(value);
-        ++index;
-        if (value != L'=') continue;
-        while (index < result.size() && iswspace(result[index]))
-            normalized.push_back(result[index++]);
-        if (index >= result.size() || result[index] == L'\"' ||
-            result[index] == L'\'' || result[index] == L'>' ||
-            result[index] == L'/') continue;
-        size_t end = index;
-        while (end < result.size() && !iswspace(result[end]) &&
-               result[end] != L'>' && result[end] != L'\"' &&
-               result[end] != L'\'') ++end;
-        size_t value_end = end;
-        if (value_end > index && result[value_end - 1] == L'/') --value_end;
-        normalized.push_back(L'\"');
-        normalized.append(result, index, value_end - index);
-        normalized.push_back(L'\"');
-        normalized.append(result, value_end, end - value_end);
-        // Some published skins terminate an otherwise unquoted value with a
-        // stray quote (`position=-207,12,0,187," resize_rect=...`).  The
-        // native reader treats it as the end delimiter; discard it here.
-        index = end < result.size() && (result[end] == L'\"' ||
-            result[end] == L'\'') ? end + 1 : end;
-    }
-    result = std::move(normalized);
-    // The same permissive parser also keeps the first occurrence of an
-    // immediately repeated attribute.  ouptix.skn contains
-    // `align="" align=""`; XML DOM rejects the entire document for it.
-    const std::wregex adjacent_duplicate(
-        L"(\\s+([A-Za-z_][A-Za-z0-9_-]*)\\s*=\\s*(\\\"[^\\\"]*\\\"|'[^']*'))"
-        L"\\s+\\2\\s*=\\s*(\\\"[^\\\"]*\\\"|'[^']*')");
-    for (;;) {
-        const std::wstring deduplicated = std::regex_replace(
-            result, adjacent_duplicate, L"$1");
-        if (deduplicated == result) break;
-        result = deduplicated;
-    }
-    // Old skin metadata commonly embeds a query string with a literal '&'
-    // in url=. The legacy reader accepts it; XML 1.0 requires escaping it.
-    for (size_t offset{}; (offset = result.find(L'&', offset)) !=
-                          std::wstring::npos;) {
-        const bool entity = result.compare(offset, 5, L"&amp;") == 0 ||
-            result.compare(offset, 4, L"&lt;") == 0 ||
-            result.compare(offset, 4, L"&gt;") == 0 ||
-            result.compare(offset, 6, L"&quot;") == 0 ||
-            result.compare(offset, 6, L"&apos;") == 0 ||
-            (offset + 2 < result.size() && result[offset + 1] == L'#' &&
-             result.find(L';', offset + 2) != std::wstring::npos);
-        if (entity) {
-            ++offset;
-        } else {
-            result.replace(offset, 1, L"&amp;");
-            offset += 5;
-        }
-    }
+
     return result;
 }
 
-std::wstring DecodeLegacyXml(const std::filesystem::path& path) {
+std::wstring DecodeLegacyXml(const std::filesystem::path& path, bool main_document = true) {
     std::ifstream input(path, std::ios::binary);
     if (!input) throw std::runtime_error("cannot open Skin.xml");
-    const std::vector<unsigned char> bytes(
-        (std::istreambuf_iterator<char>(input)), {});
-    return DecodeLegacyXml(bytes);
+    input.seekg(0, std::ios::end);
+    const auto length = input.tellg();
+    if (length <= 0 || length > static_cast<std::streamoff>(LegacyXmlDocument::MaxBytes))
+        throw std::runtime_error("invalid Skin.xml length");
+    input.seekg(0);
+    std::vector<unsigned char> bytes(static_cast<size_t>(length));
+    if (!input.read(reinterpret_cast<char*>(bytes.data()), length))
+        throw std::runtime_error("truncated Skin.xml");
+    return DecodeLegacyXml(bytes, main_document);
 }
 
 bool IsFourStateButton(std::wstring_view name) {
@@ -248,40 +139,9 @@ bool IsFourStateButton(std::wstring_view name) {
 std::optional<SkinMetadata> ParseLegacySkinMetadata(
     std::span<const unsigned char> xml_bytes) {
     try {
-        // DecodeLegacyXml deliberately accepts and strips an UTF-8 BOM.  The
-        // native token reader did not, but accepting it is required for
-        // otherwise valid packages such as 004941_088.skn.
-        ComScope com;
-        if (FAILED(com.result) && com.result != RPC_E_CHANGED_MODE)
-            return std::nullopt;
-
-        IXMLDOMDocument* document{};
-        if (FAILED(CoCreateInstance(__uuidof(DOMDocument60), nullptr,
-                                    CLSCTX_INPROC_SERVER,
-                                    IID_PPV_ARGS(&document)))) {
-            return std::nullopt;
-        }
-        document->put_async(VARIANT_FALSE);
-        auto xml = DecodeLegacyXml(xml_bytes);
-        // FUN_004A7929 consumes one root element and ignores bytes after its
-        // closing tag.  Preserve that behavior for published skins carrying
-        // an obsolete coordinate line after </skin>.
-        if (const size_t end = xml.find(L"</skin>"); end != std::wstring::npos)
-            xml.erase(end + std::wstring_view(L"</skin>").size());
-
-        VARIANT_BOOL loaded{};
-        document->loadXML(_bstr_t(xml.c_str()), &loaded);
-        if (loaded != VARIANT_TRUE) {
-            document->Release();
-            return std::nullopt;
-        }
-
-        IXMLDOMNode* root{};
-        document->selectSingleNode(_bstr_t(L"/skin"), &root);
-        if (!root) {
-            document->Release();
-            return std::nullopt;
-        }
+        LegacyXmlDocument document(DecodeLegacyXml(xml_bytes));
+        const auto* root = document.First(L"/*[1]");
+        if (!root) return std::nullopt;
 
         SkinMetadata result;
         result.version = ParseInt(Attribute(root, L"version"), 0);
@@ -297,8 +157,6 @@ std::optional<SkinMetadata> ParseLegacySkinMetadata(
             result.transparent_color = ParseColor(
                 Attribute(root, L"transparent_color"), CLR_INVALID);
         }
-        root->Release();
-        document->Release();
         if (result.version != 2) return std::nullopt;
         return result;
     } catch (const std::exception&) {
@@ -306,9 +164,7 @@ std::optional<SkinMetadata> ParseLegacySkinMetadata(
     }
 }
 
-LegacySkin::~LegacySkin() {
-    if (icon_) DestroyIcon(icon_);
-}
+LegacySkin::~LegacySkin() = default;
 
 LegacySkin::LegacySkin(LegacySkin&& other) noexcept {
     *this = std::move(other);
@@ -316,12 +172,12 @@ LegacySkin::LegacySkin(LegacySkin&& other) noexcept {
 
 LegacySkin& LegacySkin::operator=(LegacySkin&& other) noexcept {
     if (this == &other) return *this;
-    if (icon_) DestroyIcon(icon_);
     bitmaps_ = std::move(other.bitmaps_);
     // Layouts/cache share RAII images. Clear moved-from references as well.
     other.bitmaps_.clear();
     background_ = std::exchange(other.background_, nullptr);
-    icon_ = std::exchange(other.icon_, nullptr);
+    icons_ = std::move(other.icons_);
+    assets_ = std::move(other.assets_);
     window_size_ = other.window_size_;
     transparent_color_ = other.transparent_color_;
     elements_ = std::move(other.elements_);
@@ -341,18 +197,41 @@ LegacySkin& LegacySkin::operator=(LegacySkin&& other) noexcept {
     return *this;
 }
 
-SkinImage LegacySkin::LoadBitmap(const std::filesystem::path& path) {
+bool LegacySkin::PrepareAsset(const std::filesystem::path& path) const {
+    if (path.empty()) return false;
+    try { return assets_ ? assets_(path) : std::filesystem::is_regular_file(path); }
+    catch (const std::exception&) { return false; }
+}
+
+SkinImage LegacySkin::LoadBitmap(const std::filesystem::path& path, bool* replacement_started) {
+    if (replacement_started) *replacement_started = false;
     auto key = path.lexically_normal().wstring();
     std::transform(key.begin(), key.end(), key.begin(), towlower);
-    if (const auto found = bitmaps_.find(key); found != bitmaps_.end()) return found->second;
-    const auto bitmap = SkinImage::Load(path);
-    if (!bitmap) return nullptr;
-    bitmaps_.emplace(key, bitmap);
+    if (const auto found = bitmaps_.find(key); found != bitmaps_.end()) {
+        if (replacement_started) *replacement_started = true;
+        return found->second;
+    }
+    if (!PrepareAsset(path)) return nullptr;
+    const auto bitmap = SkinImage::Load(path, replacement_started);
+    if (bitmap) bitmaps_.emplace(key, bitmap);
     return bitmap;
 }
 
+LegacySkin LegacySkin::LoadPackage(const SkinPackage& package,
+    const std::filesystem::path& directory, HMODULE ttpcomm, const settings::Settings* current) {
+    return Load(directory, current, [&](const std::filesystem::path& path) {
+        return package.ExtractEntryTo(directory, path.lexically_relative(directory).generic_wstring(), ttpcomm);
+    });
+}
+
 namespace {
-SkinAnimation LoadAnimation(IXMLDOMNode* node, int default_mode) {
+bool HasIconBytes(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    return !error && size != 0;
+}
+
+SkinAnimation LoadAnimation(LegacyXmlNode* node, int default_mode) {
     SkinAnimation result;
     result.mode = ParseInt(Attribute(node, L"flash_mode"), default_mode);
     result.frame_count = ParseInt(Attribute(node, L"frame_count"), 10);
@@ -364,53 +243,56 @@ SkinAnimation LoadAnimation(IXMLDOMNode* node, int default_mode) {
 }
 
 void LoadElementAnimation(LegacySkin& skin, const std::filesystem::path& directory,
-                          IXMLDOMNode* node, SkinElement& element) {
+                          LegacyXmlNode* node, SkinElement& element) {
     element.animation = LoadAnimation(node, element.four_state ? 1 : 0);
     if (element.four_state && element.animation.mode > 2) element.animation.mode = 0;
     const auto flash = Attribute(node, L"flash_image");
     if (!flash.empty()) {
-        element.flash_image = skin.LoadBitmap(directory / flash);
-        element.flash_size = element.flash_image.Size();
+        bool replace{};
+        auto image = skin.LoadBitmap(SkinAssetPath(directory, flash), &replace);
+        if (replace) {
+            element.flash_image = std::move(image);
+            element.flash_size = element.flash_image.Size();
+        }
     }
 }
 
 SkinBitmap LoadSkinBitmap(LegacySkin& skin, const std::filesystem::path& directory,
-                          IXMLDOMNode* node, const wchar_t* attribute, const SkinBitmap* previous = nullptr) {
+                          LegacyXmlNode* node, const wchar_t* attribute, const SkinBitmap* previous = nullptr) {
     SkinBitmap result = previous ? *previous : SkinBitmap{};
     const auto name = Attribute(node, attribute);
     if (name.empty()) return result;
     // Keep bitmap ownership centralized in LegacySkin::bitmaps_.
-    auto candidate = skin.LoadBitmap(SkinAssetPath(directory, name));
-    if (candidate) {
+    bool replace{};
+    auto candidate = skin.LoadBitmap(SkinAssetPath(directory, name), &replace);
+    if (replace) {
         result.image = std::move(candidate);
-        BITMAP info{};
-        GetObjectW(result.image, sizeof(info), &info);
-        result.size = {info.bmWidth, info.bmHeight};
+        result.size = result.image.Size();
     }
     return result;
 }
 
 SkinElement LoadEqualizerElement(LegacySkin& skin,
                                  const std::filesystem::path& directory,
-                                 IXMLDOMNode* node, std::wstring name,
+                                 LegacyXmlNode* node, std::wstring name,
                                  bool button, bool force_vertical = false,
-                                 const SkinElement* previous = nullptr) {
+                                 const SkinElement* previous = nullptr,
+                                 bool image_alignment = false) {
     SkinElement element = previous ? *previous : SkinElement{};
     element.name = std::move(name);
     element.bounds = ParseRect(Attribute(node, L"position"), element.bounds);
-    element.alignment = ParseAlignment(Attribute(node, L"align"));
+    element.alignment = image_alignment ? ParseAlignment(Attribute(node, L"align")) : 0;
     const auto vertical = Attribute(node, L"vertical");
     element.vertical = force_vertical || _wcsicmp(vertical.c_str(), L"true") == 0;
     element.four_state = button;
     const auto load = [&](const wchar_t* attribute, SkinImage& bitmap, SIZE& size) {
         const auto file = Attribute(node, attribute);
         if (file.empty()) return;
-        auto candidate = skin.LoadBitmap(SkinAssetPath(directory, file));
-        if (!candidate) return;
+        bool replace{};
+        auto candidate = skin.LoadBitmap(SkinAssetPath(directory, file), &replace);
+        if (!replace) return;
         bitmap = std::move(candidate);
-        BITMAP info{};
-        GetObjectW(bitmap, sizeof(info), &info);
-        size = {info.bmWidth, info.bmHeight};
+        size = bitmap.Size();
     };
     load(L"image", element.image, element.image_size);
     load(L"bar_image", element.bar_image, element.bar_size);
@@ -430,7 +312,7 @@ SkinElement LoadEqualizerElement(LegacySkin& skin,
 
 SkinElement LoadPlaylistImageElement(LegacySkin& skin,
                                      const std::filesystem::path& directory,
-                                     IXMLDOMNode* node, std::wstring name,
+                                     LegacyXmlNode* node, std::wstring name,
                                      const SkinElement* previous = nullptr) {
     SkinElement element = previous ? *previous : SkinElement{};
     element.name = std::move(name);
@@ -438,12 +320,14 @@ SkinElement LoadPlaylistImageElement(LegacySkin& skin,
     element.alignment = ParseAlignment(Attribute(node, L"align"));
     const auto image = Attribute(node, L"image");
     if (!image.empty()) {
-        if (auto candidate = skin.LoadBitmap(SkinAssetPath(directory, image))) {
+        bool replace{};
+        auto candidate = skin.LoadBitmap(SkinAssetPath(directory, image), &replace);
+        if (replace) {
             element.image = std::move(candidate);
             element.image_size = element.image.Size();
         }
     }
-    if (element.name == L"close" && element.image && element.image_size.cx >= 4) {
+    if (element.name == L"close" && element.image && !IsRectEmpty(&element.bounds)) {
         element.four_state = true;
         element.frames = 4;
         element.bounds.left = element.bounds.right - element.image_size.cx / 4;
@@ -514,12 +398,6 @@ bool ParseLogFont(const std::wstring& descriptor, LOGFONTW& font) {
             &value[0], &value[1], &value[2], &value[3], &value[4],
             &value[5], &value[6], &value[7], &value[8], &value[9],
             &value[10], &value[11], &value[12]) != 13) return false;
-    size_t comma = 0;
-    for (size_t index = 0; index < value.size(); ++index) {
-        comma = descriptor.find(L',', comma);
-        if (comma == std::wstring::npos) return false;
-        ++comma;
-    }
     parsed.lfHeight = value[0];
     parsed.lfWidth = value[1];
     parsed.lfEscapement = value[2];
@@ -536,7 +414,14 @@ bool ParseLogFont(const std::wstring& descriptor, LOGFONTW& font) {
     // FUN_0048DE50 always copies the final field, including an empty face
     // name.  This intentionally clears the seeded face while preserving all
     // thirteen numeric LOGFONT members.
-    wcsncpy_s(parsed.lfFaceName, descriptor.c_str() + comma, _TRUNCATE);
+    size_t comma = 0;
+    bool face_present = true;
+    for (size_t index = 0; index < value.size(); ++index) {
+        comma = descriptor.find(L',', comma);
+        if (comma == std::wstring::npos) { face_present = false; break; }
+        ++comma;
+    }
+    if (face_present) wcsncpy_s(parsed.lfFaceName, descriptor.c_str() + comma, _TRUNCATE);
     font = parsed;
     return true;
 }
@@ -544,23 +429,9 @@ bool ParseLogFont(const std::wstring& descriptor, LOGFONTW& font) {
 void LoadLyricColors(const std::filesystem::path& directory, LyricSkin& lyric) {
     const auto path = directory / L"Lyric.xml";
     if (!std::filesystem::exists(path)) return;
-    ComScope com;
-    IXMLDOMDocument* document{};
-    if (FAILED(CoCreateInstance(__uuidof(DOMDocument60), nullptr, CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(&document)))) return;
-    document->put_async(VARIANT_FALSE);
-    VARIANT_BOOL loaded{};
     try {
-        const auto xml = DecodeLegacyXml(path);
-        document->loadXML(_bstr_t(xml.c_str()), &loaded);
-    } catch (const std::exception&) {
-        document->Release();
-        return;
-    }
-    if (loaded == VARIANT_TRUE) {
-        IXMLDOMNode* node{};
-        document->selectSingleNode(_bstr_t(L"/ttplayer_lyric/Lyric"), &node);
-        if (node) {
+        LegacyXmlDocument document(DecodeLegacyXml(path, false));
+        if (const auto* node = document.First(L"/ttplayer_lyric/Lyric")) {
             static_cast<void>(ParseLogFont(Attribute(node, L"Font"), lyric.font));
             lyric.text_color = ParseColor(Attribute(node, L"TextColor"),
                                           lyric.text_color);
@@ -568,32 +439,18 @@ void LoadLyricColors(const std::filesystem::path& directory, LyricSkin& lyric) {
                                                lyric.highlight_color);
             lyric.background_color = ParseColor(Attribute(node, L"BkgndColor"),
                                                 lyric.background_color);
-            node->Release();
         }
+    } catch (const std::exception&) {
+        // A malformed optional sidecar leaves the seeded settings unchanged.
     }
-    document->Release();
 }
 
 void LoadPlaylistColors(const std::filesystem::path& directory, PlaylistSkin& playlist) {
     const auto path = directory / L"Playlist.xml";
     if (!std::filesystem::exists(path)) return;
-    ComScope com;
-    IXMLDOMDocument* document{};
-    if (FAILED(CoCreateInstance(__uuidof(DOMDocument60), nullptr, CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(&document)))) return;
-    document->put_async(VARIANT_FALSE);
-    VARIANT_BOOL loaded{};
     try {
-        const auto xml = DecodeLegacyXml(path);
-        document->loadXML(_bstr_t(xml.c_str()), &loaded);
-    } catch (const std::exception&) {
-        document->Release();
-        return;
-    }
-    if (loaded == VARIANT_TRUE) {
-        IXMLDOMNode* node{};
-        document->selectSingleNode(_bstr_t(L"/ttplayer_playlist/PlayList"), &node);
-        if (node) {
+        LegacyXmlDocument document(DecodeLegacyXml(path, false));
+        if (const auto* node = document.First(L"/ttplayer_playlist/PlayList")) {
             static_cast<void>(ParseLogFont(Attribute(node, L"Font"), playlist.font_descriptor));
             playlist.font = playlist.font_descriptor.lfFaceName;
             playlist.font_height = playlist.font_descriptor.lfHeight;
@@ -614,34 +471,19 @@ void LoadPlaylistColors(const std::filesystem::path& directory, PlaylistSkin& pl
             }
             playlist.alternate_background_color = ParseColor(
                 Attribute(node, L"Color_Bkgnd2"), playlist.alternate_background_color);
-            node->Release();
         }
+    } catch (const std::exception&) {
+        // A malformed optional sidecar leaves the seeded settings unchanged.
     }
-    document->Release();
 }
 
 void LoadVisualSettings(const std::filesystem::path& directory,
-                        VisualSkin& visual) {
+                        VisualSkin& visual, const settings::Settings* current) {
     const auto path = directory / L"Visual.xml";
     if (!std::filesystem::exists(path)) return;
-    ComScope com;
-    IXMLDOMDocument* document{};
-    if (FAILED(CoCreateInstance(__uuidof(DOMDocument60), nullptr,
-            CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&document))) || !document)
-        return;
-    document->put_async(VARIANT_FALSE);
-    VARIANT_BOOL loaded{};
     try {
-        const auto xml = DecodeLegacyXml(path);
-        document->loadXML(_bstr_t(xml.c_str()), &loaded);
-    } catch (const std::exception&) {
-        document->Release();
-        return;
-    }
-    if (loaded == VARIANT_TRUE) {
-        IXMLDOMNode* node{};
-        document->selectSingleNode(_bstr_t(L"/ttplayer_visual/Visual"), &node);
-        if (node) {
+        LegacyXmlDocument document(DecodeLegacyXml(path, false));
+        if (const auto* node = document.First(L"/ttplayer_visual/Visual")) {
             const auto color = [&](const wchar_t* name,
                                    std::optional<COLORREF>& destination) {
                 const auto source = Attribute(node, name);
@@ -662,78 +504,31 @@ void LoadVisualSettings(const std::filesystem::path& directory,
             integer(L"BlurSpeed", visual.blur_speed);
             integer(L"Type", visual.type);
             const auto blur = Attribute(node, L"Blur");
-            if (!blur.empty()) visual.blur = ParseBool(blur);
+            if (!blur.empty()) visual.blur = ParseInt(blur, 0) != 0;
             color(L"BlurScopeColor", visual.blur_scope_color);
             color(L"TextColor", visual.text_color);
             const auto descriptor = Attribute(node, L"Font");
             if (!descriptor.empty()) {
                 LOGFONTW font{};
+                InitializeDefaultLogFont(font);
+                if (current && current->visual.font_valid) font = current->visual.font;
                 if (ParseLogFont(descriptor, font)) visual.font = font;
             }
             visual.valid = true;
-            node->Release();
         }
+    } catch (const std::exception&) {
+        // A malformed optional sidecar leaves the seeded settings unchanged.
     }
-    document->Release();
 }
 } // namespace
 
 LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
-                            const settings::Settings* current) {
-    ComScope com;
-    if (FAILED(com.result) && com.result != RPC_E_CHANGED_MODE) throw std::runtime_error("COM init failed");
-    IXMLDOMDocument* document{};
-    if (FAILED(CoCreateInstance(__uuidof(DOMDocument60), nullptr, CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(&document)))) {
-        throw std::runtime_error("MSXML6 unavailable");
-    }
-    document->put_async(VARIANT_FALSE);
-    VARIANT_BOOL loaded{};
-    auto xml = DecodeLegacyXml(directory / L"Skin.xml");
-    // The original streaming XML reader stops at </skin>. Several published
-    // packages append an old coordinate line after the root element (for
-    // example ironger-BlueArmorPlayer); MSXML rejects that otherwise valid
-    // package as top-level trailing content.
-    if (const size_t end = xml.find(L"</skin>"); end != std::wstring::npos)
-        xml.erase(end + std::wstring_view(L"</skin>").size());
-    document->loadXML(_bstr_t(xml.c_str()), &loaded);
-    if (loaded != VARIANT_TRUE) {
-        IXMLDOMParseError* parse_error{};
-        std::string detail;
-        if (SUCCEEDED(document->get_parseError(&parse_error)) && parse_error) {
-            BSTR reason{};
-            parse_error->get_reason(&reason);
-            if (reason) {
-                const int length = WideCharToMultiByte(CP_UTF8, 0, reason, SysStringLen(reason),
-                    nullptr, 0, nullptr, nullptr);
-                detail.resize(static_cast<size_t>(length));
-                WideCharToMultiByte(CP_UTF8, 0, reason, SysStringLen(reason), detail.data(), length,
-                    nullptr, nullptr);
-                SysFreeString(reason);
-            }
-            long line{};
-            long position{};
-            parse_error->get_line(&line);
-            parse_error->get_linepos(&position);
-            if (line > 0) detail += " (line " + std::to_string(line) +
-                ", column " + std::to_string(position) + ")";
-            if (line == 1 && position > 0) {
-                const size_t begin = static_cast<size_t>(std::max(0L, position - 16));
-                const size_t length = std::min<size_t>(48, xml.size() -
-                    std::min(begin, xml.size()));
-                std::string context;
-                context.reserve(length);
-                for (const wchar_t value : xml.substr(begin, length))
-                    context.push_back(value < 0x80 ? static_cast<char>(value) : '?');
-                detail += " near `" + context + "`";
-            }
-            parse_error->Release();
-        }
-        document->Release();
-        throw std::runtime_error("invalid Skin.xml: " + detail);
-    }
-
+                            const settings::Settings* current, AssetLoader assets) {
     LegacySkin skin;
+    skin.assets_ = std::move(assets);
+    if (!skin.PrepareAsset(directory / L"Skin.xml")) throw std::runtime_error("Skin.xml unavailable");
+    LegacyXmlDocument document(DecodeLegacyXml(directory / L"Skin.xml"));
+
     InitializeDefaultLogFont(skin.lyric_.font);
     InitializeDefaultLogFont(skin.playlist_.font_descriptor);
     // 0048E635 / 0048EA53 seed package descriptors from the current settings
@@ -762,48 +557,29 @@ LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
         if (current->lyric.background_color != CLR_INVALID)
             lyric.background_color = current->lyric.background_color;
     }
-    IXMLDOMNode* root{};
-    document->selectSingleNode(_bstr_t(L"/skin"), &root);
+    const auto* root = document.First(L"/*[1]");
     if (!root || ParseInt(Attribute(root, L"version"), 0) != 2) {
-        if (root) root->Release();
-        document->Release();
         throw std::runtime_error("unsupported Skin.xml version (expected 2)");
     }
     skin.transparent_color_ = ParseColor(Attribute(root, L"transparent_color"), CLR_INVALID);
-    if (root) root->Release();
 
     // 004A8536 writes fixed slots. Repeated definitions update the same slot;
     // missing/failed bitmap loads preserve its previous image (004A9D8C).
     const auto load_player = [&](const wchar_t* path, SkinImage& background,
-                                 SIZE& size, std::vector<SkinElement>& elements) {
-        IXMLDOMNodeList* windows{};
-        document->selectNodes(_bstr_t(path), &windows);
-        long window_count{};
-        if (windows) windows->get_length(&window_count);
-        for (long w = 0; w < window_count; ++w) {
-            IXMLDOMNode* window{};
-            windows->get_item(w, &window);
-            if (!window) continue;
+                                 SIZE& size, std::vector<SkinElement>& elements, SkinIcons& icons) {
+        for (auto* window : document.Nodes(path)) {
             const auto file = Attribute(window, L"image");
             if (!file.empty()) {
-                if (auto image = skin.LoadBitmap(SkinAssetPath(directory, file))) {
+                bool replace{};
+                auto image = skin.LoadBitmap(SkinAssetPath(directory, file), &replace);
+                if (replace) {
                     background = image;
                     size = image.Size();
                 }
             }
-            IXMLDOMNodeList* children{};
-            window->get_childNodes(&children);
-            long count{};
-            if (children) children->get_length(&count);
-            for (long i = 0; i < count; ++i) {
-                IXMLDOMNode* node{};
-                children->get_item(i, &node);
-                if (!node) continue;
-                BSTR raw{};
-                node->get_nodeName(&raw);
-                const std::wstring name = raw ? raw : L"";
-                SysFreeString(raw);
-                if (PlayerSkinOrder(name) < 0) { node->Release(); continue; }
+            for (auto* node : window->Children()) {
+                const std::wstring& name = node->name;
+                if (PlayerSkinOrder(name) < 0) { continue; }
                 auto it = std::find_if(elements.begin(), elements.end(),
                     [&](const auto& e) { return e.name == name; });
                 if (it == elements.end()) {
@@ -816,7 +592,10 @@ LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
                 element.bounds = ParseRect(Attribute(node, L"position"), element.bounds);
                 element.color = ParseColor(Attribute(node, L"color"), RGB(255,255,255));
                 element.background = ParseColor(Attribute(node, L"bkgnd"), 0xff000000);
-                element.alignment = ParseAlignment(Attribute(node, L"align"));
+                const bool text = name == L"icon" || name == L"info" || name == L"stereo" ||
+                    name == L"status" || name == L"login_name";
+                element.alignment = text ? ParseAlignment(Attribute(node, L"align"), 1) :
+                    (name == L"led" || name == L"visual") ? ParseAlignment(Attribute(node, L"align")) : 0;
                 const auto font = Attribute(node, L"font");
                 if (!font.empty()) {
                     element.font = font;
@@ -826,7 +605,9 @@ LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
                 const auto load = [&](const wchar_t* attr, SkinImage& image, SIZE& image_size) {
                     const auto file_name = Attribute(node, attr);
                     if (!file_name.empty()) {
-                        if (auto candidate = skin.LoadBitmap(SkinAssetPath(directory, file_name))) {
+                        bool replace{};
+                        auto candidate = skin.LoadBitmap(SkinAssetPath(directory, file_name), &replace);
+                        if (replace) {
                             image = candidate;
                             image_size = candidate.Size();
                         }
@@ -839,76 +620,68 @@ LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
                 load(L"thumb_image", element.thumb_image, element.thumb_size);
                 if (element.four_state && element.image) {
                     element.frames = 4;
-                    element.bounds.right = element.bounds.left + element.image_size.cx / 4;
-                    element.bounds.bottom = element.bounds.top + element.image_size.cy;
+                    // The host only binds a bitmap to a nonempty descriptor.
+                    // An absent/unparseable position remains a zero-size child;
+                    // it must not acquire a hit target merely from its image.
+                    if (!IsRectEmpty(&element.bounds)) {
+                        element.bounds.right = element.bounds.left + element.image_size.cx / 4;
+                        element.bounds.bottom = element.bounds.top + element.image_size.cy;
+                    }
                 }
                 if (name == L"icon") {
-                    const auto icon_file = Attribute(node, L"icon");
-                    if (!icon_file.empty()) {
-                        const auto icon = static_cast<HICON>(LoadImageW(nullptr,
-                            (SkinAssetPath(directory, icon_file)).c_str(), IMAGE_ICON,
-                            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE));
-                        if (icon) {
-                            if (skin.icon_) DestroyIcon(skin.icon_);
-                            skin.icon_ = icon;
-                        }
+                    const auto icon_path = SkinAssetPath(directory, Attribute(node, L"icon"));
+                    if (skin.PrepareAsset(icon_path) && HasIconBytes(icon_path)) {
+                        icons.small_icon.Reset(static_cast<HICON>(LoadImageW(nullptr, icon_path.c_str(), IMAGE_ICON,
+                            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE)));
+                        icons.large_icon.Reset(static_cast<HICON>(LoadImageW(nullptr, icon_path.c_str(), IMAGE_ICON,
+                            GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_LOADFROMFILE)));
                     }
                 }
                 LoadElementAnimation(skin, directory, node, element);
-                node->Release();
             }
-            if (children) children->Release();
-            window->Release();
         }
-        if (windows) windows->Release();
+        // The original always owns a SkinIcon child. 0045C937 installs the
+        // application fallback even when the descriptor has no <icon> node.
+        if (background && std::none_of(elements.begin(), elements.end(),
+            [](const auto& element) { return element.name == L"icon"; })) {
+            SkinElement icon;
+            icon.name = L"icon";
+            elements.push_back(std::move(icon));
+        }
         std::stable_sort(elements.begin(), elements.end(), [](const auto& a, const auto& b) {
             return PlayerSkinOrder(a.name) < PlayerSkinOrder(b.name);
         });
     };
-    load_player(L"/skin/player_window", skin.background_, skin.window_size_, skin.elements_);
-    load_player(L"/skin/mini_window", skin.mini_.background, skin.mini_.window_size, skin.mini_.elements);
+    load_player(L"/*[1]/player_window", skin.background_, skin.window_size_, skin.elements_, skin.icons_);
+    load_player(L"/*[1]/mini_window", skin.mini_.background, skin.mini_.window_size, skin.mini_.elements, skin.mini_.icons);
     if (!skin.background_) {
-        document->Release();
         throw std::runtime_error("player skin bitmap unavailable");
     }
 
     // 004A88D0 stores lyric_window at skin-object offset +0x91C.  Its three
     // commands are real four-frame SkinButton children and its lyric rect is
     // enlarged by the same delta as the resizable popup.
-    for (auto* lyric_window : Nodes(document, L"/skin/lyric_window")) {
+    for (auto* lyric_window : Nodes(document, L"/*[1]/lyric_window")) {
         auto& lyric = skin.lyric_;
-        lyric.position = ParseRect(Attribute(lyric_window, L"position"));
-        lyric.resize_rect = ParseRect(Attribute(lyric_window, L"resize_rect"));
+        lyric.mini_border_left_top = lyric.mini_border_right_bottom = 0xff000000;
+        lyric.position = ParseRect(Attribute(lyric_window, L"position"), lyric.position);
+        lyric.resize_rect = ParseRect(Attribute(lyric_window, L"resize_rect"), lyric.resize_rect);
         lyric.resize_tile = ParseInt(Attribute(lyric_window, L"resize_tile"), 0) != 0;
         lyric.background = LoadSkinBitmap(skin, directory, lyric_window, L"image", &lyric.background);
         lyric.valid = lyric.background.image != nullptr;
 
-        IXMLDOMNodeList* lyric_children{};
-        lyric_window->get_childNodes(&lyric_children);
-        long lyric_count{};
-        if (lyric_children) lyric_children->get_length(&lyric_count);
-        for (long index = 0; index < lyric_count; ++index) {
-            IXMLDOMNode* node{};
-            lyric_children->get_item(index, &node);
-            if (!node) continue;
-            DOMNodeType type{};
-            node->get_nodeType(&type);
-            if (type != NODE_ELEMENT) { node->Release(); continue; }
-            BSTR raw_name{};
-            node->get_nodeName(&raw_name);
-            const std::wstring name = raw_name
-                ? std::wstring(raw_name, SysStringLen(raw_name)) : std::wstring{};
-            if (raw_name) SysFreeString(raw_name);
+        for (auto* node : lyric_window->Children()) {
+            const std::wstring& name = node->name;
             if (name == L"title") {
-                lyric.title = LoadEqualizerElement(skin, directory, node, name, false, false, &lyric.title);
+                lyric.title = LoadEqualizerElement(skin, directory, node, name, false, false, &lyric.title, true);
             } else if (name == L"close") {
-                lyric.close = LoadEqualizerElement(skin, directory, node, name, true, false, &lyric.close);
+                lyric.close = LoadEqualizerElement(skin, directory, node, name, true, false, &lyric.close, true);
             } else if (name == L"ontop") {
-                lyric.ontop = LoadEqualizerElement(skin, directory, node, name, true, false, &lyric.ontop);
+                lyric.ontop = LoadEqualizerElement(skin, directory, node, name, true, false, &lyric.ontop, true);
             } else if (name == L"desklrc") {
-                lyric.desklrc = LoadEqualizerElement(skin, directory, node, name, true, false, &lyric.desklrc);
+                lyric.desklrc = LoadEqualizerElement(skin, directory, node, name, true, false, &lyric.desklrc, true);
             } else if (name == L"lyric") {
-                lyric.lyric_bounds = ParseRect(Attribute(node, L"position"));
+                lyric.lyric_bounds = ParseRect(Attribute(node, L"position"), lyric.lyric_bounds);
             } else if (name == L"mini_border") {
                 lyric.mini_border_left_top = ParseColor(
                     Attribute(node, L"left_top_color"), 0xff000000);
@@ -933,47 +706,29 @@ LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
                     padding.right <= 1024 && padding.bottom <= 1024)
                     lyric.mini_padding = padding;
             }
-            node->Release();
         }
-        if (lyric_children) lyric_children->Release();
-        lyric_window->Release();
-        LoadLyricColors(directory, lyric);
     }
 
     // 004A92A2 parses /skin/desklrc_bar after the ordinary lyric window.
     // Unlike the main skin controls its XML rectangles are retained verbatim:
     // FUN_004186BC installs the four-frame images and then applies positions.
-    for (auto* desktop_bar_node : Nodes(document, L"/skin/desklrc_bar")) {
+    for (auto* desktop_bar_node : Nodes(document, L"/*[1]/desklrc_bar")) {
         auto& bar = skin.desktop_lyric_bar_;
         bar.background = LoadSkinBitmap(skin, directory, desktop_bar_node, L"image", &bar.background);
         bar.transparent_color = ParseColor(
             Attribute(desktop_bar_node, L"transparent_color"),
-            RGB(255, 0, 255));
+            CLR_INVALID);
         bar.valid = bar.background.image != nullptr;
 
-        IXMLDOMNodeList* bar_children{};
-        desktop_bar_node->get_childNodes(&bar_children);
-        long bar_count{};
-        if (bar_children) bar_children->get_length(&bar_count);
-        for (long index = 0; index < bar_count; ++index) {
-            IXMLDOMNode* node{};
-            bar_children->get_item(index, &node);
-            if (!node) continue;
-            DOMNodeType type{};
-            node->get_nodeType(&type);
-            if (type != NODE_ELEMENT) {
-                node->Release();
-                continue;
-            }
-            BSTR raw_name{};
-            node->get_nodeName(&raw_name);
-            const std::wstring name = raw_name
-                ? std::wstring(raw_name, SysStringLen(raw_name))
-                : std::wstring{};
-            if (raw_name) SysFreeString(raw_name);
+        for (auto* node : desktop_bar_node->Children()) {
+            const std::wstring& name = node->name;
 
             if (name == L"icon") {
-                bar.icon = ParseRect(Attribute(node, L"position"));
+                bar.icon = ParseRect(Attribute(node, L"position"), bar.icon);
+                const auto path = SkinAssetPath(directory, Attribute(node, L"icon"));
+                if (skin.PrepareAsset(path) && HasIconBytes(path))
+                    bar.icon_image.Reset(static_cast<HICON>(LoadImageW(nullptr, path.c_str(), IMAGE_ICON,
+                        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE)));
             } else {
                 SkinElement* target{};
                 const struct { const wchar_t* name; SkinElement* field; } fields[] = {
@@ -986,42 +741,26 @@ LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
                 for (const auto& field : fields) if (name == field.name) target = field.field;
                 if (target) *target = LoadEqualizerElement(skin, directory, node, name, true, false, target);
             }
-            node->Release();
         }
-        if (bar_children) bar_children->Release();
-        desktop_bar_node->Release();
     }
 
     // CSkinParser_ParseEqualizerWindow (004A8B73) dispatches these exact
     // node names.  In particular eqfactor is not a single control in the
     // native object: FUN_0042955B materializes ten copies at width+interval.
-    for (auto* equalizer_window : Nodes(document, L"/skin/equalizer_window")) {
+    SkinElement band_template;
+    for (auto* equalizer_window : Nodes(document, L"/*[1]/equalizer_window")) {
         auto& equalizer = skin.equalizer_;
-        equalizer.position = ParseRect(Attribute(equalizer_window, L"position"));
+        equalizer.position = ParseRect(Attribute(equalizer_window, L"position"), equalizer.position);
         equalizer.eq_interval = ParseInt(Attribute(equalizer_window, L"eq_interval"), 0);
         equalizer.background = LoadSkinBitmap(skin, directory, equalizer_window, L"image", &equalizer.background);
         equalizer.valid = equalizer.background.image != nullptr;
 
-        IXMLDOMNodeList* equalizer_children{};
-        equalizer_window->get_childNodes(&equalizer_children);
-        long equalizer_count{};
-        if (equalizer_children) equalizer_children->get_length(&equalizer_count);
-        for (long index = 0; index < equalizer_count; ++index) {
-            IXMLDOMNode* node{};
-            equalizer_children->get_item(index, &node);
-            if (!node) continue;
-            DOMNodeType type{};
-            node->get_nodeType(&type);
-            if (type != NODE_ELEMENT) { node->Release(); continue; }
-            BSTR raw_name{};
-            node->get_nodeName(&raw_name);
-            const std::wstring name = raw_name
-                ? std::wstring(raw_name, SysStringLen(raw_name)) : std::wstring{};
-            if (raw_name) SysFreeString(raw_name);
+        for (auto* node : equalizer_window->Children()) {
+            const std::wstring& name = node->name;
             if (name == L"title") {
-                equalizer.title = LoadEqualizerElement(skin, directory, node, name, false, false, &equalizer.title);
+                equalizer.title = LoadEqualizerElement(skin, directory, node, name, false, false, &equalizer.title, true);
             } else if (name == L"close") {
-                equalizer.close = LoadEqualizerElement(skin, directory, node, name, true, false, &equalizer.close);
+                equalizer.close = LoadEqualizerElement(skin, directory, node, name, true, false, &equalizer.close, true);
             } else if (name == L"enabled") {
                 equalizer.enabled = LoadEqualizerElement(skin, directory, node, name, true, false, &equalizer.enabled);
             } else if (name == L"profile") {
@@ -1030,72 +769,51 @@ LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
                 equalizer.reset = LoadEqualizerElement(skin, directory, node, name, true, false, &equalizer.reset);
             } else if (name == L"balance") {
                 equalizer.balance = LoadEqualizerElement(skin, directory, node, name, false, false, &equalizer.balance);
+                equalizer.balance.vertical = false; // 0042955B binds balance horizontally.
             } else if (name == L"surround") {
                 equalizer.surround = LoadEqualizerElement(skin, directory, node, name, false, false, &equalizer.surround);
             } else if (name == L"preamp") {
                 equalizer.preamp = LoadEqualizerElement(skin, directory, node, name, false, true, &equalizer.preamp);
             } else if (name == L"eqfactor") {
-                auto band = LoadEqualizerElement(skin, directory, node, name, false, true, &equalizer.bands[0]);
-                const LONG stride = (band.bounds.right - band.bounds.left) +
-                                    equalizer.eq_interval;
-                for (size_t band_index = 0; band_index < equalizer.bands.size(); ++band_index) {
-                    equalizer.bands[band_index] = band;
-                    equalizer.bands[band_index].name =
-                        L"eqfactor" + std::to_wstring(band_index);
-                    OffsetRect(&equalizer.bands[band_index].bounds,
-                               stride * static_cast<LONG>(band_index), 0);
-                }
+                band_template = LoadEqualizerElement(skin, directory, node, name, false, true, &band_template);
             }
-            node->Release();
         }
-        if (equalizer_children) equalizer_children->Release();
-        equalizer_window->Release();
+    }
+
+    if (!band_template.name.empty()) {
+        const LONG stride = (band_template.bounds.right - band_template.bounds.left) + skin.equalizer_.eq_interval;
+        for (size_t i = 0; i < skin.equalizer_.bands.size(); ++i) {
+            auto& band = skin.equalizer_.bands[i];
+            band = band_template;
+            band.name = L"eqfactor" + std::to_wstring(i);
+            OffsetRect(&band.bounds, stride * static_cast<LONG>(i), 0);
+        }
     }
 
     // 004A8DC6 parses playlist_window independently from player_window.  It
     // is deliberately loaded before the XML document is released so runtime
     // skin switching can update both HWNDs transactionally.
-    for (auto* playlist_window : Nodes(document, L"/skin/playlist_window")) {
+    for (auto* playlist_window : Nodes(document, L"/*[1]/playlist_window")) {
         auto& playlist = skin.playlist_;
-        playlist.position = ParseRect(Attribute(playlist_window, L"position"));
-        playlist.resize_rect = ParseRect(Attribute(playlist_window, L"resize_rect"));
+        playlist.position = ParseRect(Attribute(playlist_window, L"position"), playlist.position);
+        playlist.resize_rect = ParseRect(Attribute(playlist_window, L"resize_rect"), playlist.resize_rect);
         playlist.resize_tile = ParseInt(Attribute(playlist_window, L"resize_tile"), 0) != 0;
         playlist.background = LoadSkinBitmap(skin, directory, playlist_window, L"image", &playlist.background);
         playlist.valid = playlist.background.image != nullptr;
 
-        IXMLDOMNodeList* playlist_children{};
-        playlist_window->get_childNodes(&playlist_children);
-        long playlist_count{};
-        if (playlist_children) playlist_children->get_length(&playlist_count);
-        for (long index = 0; index < playlist_count; ++index) {
-            IXMLDOMNode* node{};
-            playlist_children->get_item(index, &node);
-            if (!node) continue;
-            DOMNodeType type{};
-            node->get_nodeType(&type);
-            if (type != NODE_ELEMENT) { node->Release(); continue; }
-            BSTR raw_name{};
-            node->get_nodeName(&raw_name);
-            const std::wstring name = raw_name
-                ? std::wstring(raw_name, SysStringLen(raw_name)) : std::wstring{};
-            if (raw_name) SysFreeString(raw_name);
+        for (auto* node : playlist_window->Children()) {
+            const std::wstring& name = node->name;
             if (name == L"title") {
                 playlist.title = LoadPlaylistImageElement(skin, directory, node, L"title", &playlist.title);
             } else if (name == L"close") {
                 playlist.close = LoadPlaylistImageElement(skin, directory, node, L"close", &playlist.close);
             } else if (name == L"toolbar") {
-                playlist.toolbar_bounds = ParseRect(Attribute(node, L"position"));
+                playlist.toolbar_bounds = ParseRect(Attribute(node, L"position"), playlist.toolbar_bounds);
                 playlist.toolbar_alignment = ParseAlignment(Attribute(node, L"align"));
                 playlist.toolbar = LoadSkinBitmap(skin, directory, node, L"image", &playlist.toolbar);
                 playlist.toolbar_hot = LoadSkinBitmap(skin, directory, node, L"hot_image", &playlist.toolbar_hot);
                 playlist.toolbar_animation = LoadAnimation(node, 1);
-                IXMLDOMNodeList* items{};
-                node->selectNodes(_bstr_t(L"item"), &items);
-                long toolbar_item_count{};
-                if (items) items->get_length(&toolbar_item_count);
-                for (long item_index = 0; item_index < toolbar_item_count; ++item_index) {
-                    IXMLDOMNode* item{};
-                    items->get_item(item_index, &item);
+                for (auto* item : node->Children(L"item")) {
                     if (!item) continue;
                     const int slot = ParseInt(Attribute(item, L"index"), -1);
                     const RECT rect = ParseRect(Attribute(item, L"position"));
@@ -1107,28 +825,22 @@ LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
                             playlist.toolbar_items.emplace(std::array<RECT, 7>{});
                         (*playlist.toolbar_items)[slot] = rect;
                     }
-                    item->Release();
                 }
-                if (items) items->Release();
             } else if (name == L"scrollbar") {
                 playlist.scrollbar_buttons = LoadSkinBitmap(skin, directory, node, L"buttons_image", &playlist.scrollbar_buttons);
                 playlist.scrollbar_thumb = LoadSkinBitmap(skin, directory, node, L"thumb_image", &playlist.scrollbar_thumb);
                 playlist.scrollbar_bar = LoadSkinBitmap(skin, directory, node, L"bar_image", &playlist.scrollbar_bar);
-                playlist.scrollbar_thumb_resize_center = std::max(0, ParseInt(
-                    Attribute(node, L"thumb_resize_center"), 0));
+                playlist.scrollbar_thumb_resize_center = ParseInt(
+                    Attribute(node, L"thumb_resize_center"), playlist.scrollbar_thumb_resize_center);
                 playlist.scrollbar_thumb_resize_tile = ParseInt(
-                    Attribute(node, L"thumb_resize_tile"), 0) != 0;
+                    Attribute(node, L"thumb_resize_tile"), playlist.scrollbar_thumb_resize_tile ? 1 : 0) != 0;
             } else if (name == L"playlist") {
-                playlist.list_bounds = ParseRect(Attribute(node, L"position"));
+                playlist.list_bounds = ParseRect(Attribute(node, L"position"), playlist.list_bounds);
                 playlist.splitter_bar = LoadSkinBitmap(skin, directory, node, L"splitter_bar_image", &playlist.splitter_bar);
                 playlist.splitter_arrow = LoadSkinBitmap(skin, directory, node, L"splitter_arrow_image", &playlist.splitter_arrow);
                 playlist.selected = LoadSkinBitmap(skin, directory, node, L"selected_image", &playlist.selected);
             }
-            node->Release();
         }
-        if (playlist_children) playlist_children->Release();
-        playlist_window->Release();
-        LoadPlaylistColors(directory, playlist);
     }
     for (auto* elements : {&skin.elements_, &skin.mini_.elements}) {
         for (auto& element : *elements) {
@@ -1140,8 +852,10 @@ LegacySkin LegacySkin::Load(const std::filesystem::path& directory,
     }
     // CSkinManager_LoadPackageXml opens Visual.xml after the window layouts
     // and stores its sparse descriptor at skin-object offset +0x498.
-    LoadVisualSettings(directory, skin.visual_);
-    document->Release();
+    if (skin.PrepareAsset(directory / L"Lyric.xml")) LoadLyricColors(directory, skin.lyric_);
+    if (skin.PrepareAsset(directory / L"Playlist.xml")) LoadPlaylistColors(directory, skin.playlist_);
+    if (skin.PrepareAsset(directory / L"Visual.xml")) LoadVisualSettings(directory, skin.visual_, current);
+    skin.assets_ = {};
     return skin;
 }
 

@@ -113,6 +113,9 @@ HRESULT ProbeAudioFormatHint(IStream* stream, std::wstring& extension) {
     LARGE_INTEGER zero{};
     ULARGE_INTEGER saved{};
     HRESULT status = stream->Seek(zero, STREAM_SEEK_CUR, &saved);
+    // A live reader cannot report/restore a random byte position. Its owner
+    // supplies a header-derived routing hint without consuming this stream.
+    if (status == STG_E_INVALIDFUNCTION || status == E_NOTIMPL) return S_FALSE;
     if (FAILED(status)) return status;
     status = stream->Seek(zero, STREAM_SEEK_SET, nullptr);
     std::array<unsigned char, 4096> header{};

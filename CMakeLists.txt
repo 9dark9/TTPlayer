@@ -77,6 +77,9 @@ add_library(ttplayer_core
   src/audio/archive_member.cpp
   src/audio/asio_sink.cpp
   src/audio/audio_engine.cpp
+  src/audio/http_stream.cpp
+  src/audio/http_download_queue.cpp
+  src/audio/http_mpeg_source.cpp
   src/audio/builtin_file_info.cpp
   src/audio/disc_lookup.cpp
   src/net/http.cpp

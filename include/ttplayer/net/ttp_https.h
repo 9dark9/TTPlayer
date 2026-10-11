@@ -106,6 +106,88 @@ typedef struct ttp_https_api_v4 {
     void (__cdecl *release_http)(ttp_https_http_response *);
 } ttp_https_api_v4;
 
+/* ABI 5: a single HTTPS exchange. Redirects are returned, never followed, so
+   the caller can scope cookies to each destination. No global cookie store. */
+#define TTP_HTTPS_EXCHANGE_ABI_VERSION 5u
+typedef struct ttp_https_exchange_request {
+    uint32_t size;
+    ttp_https_request request;
+    const char *cookie; /* Optional printable ASCII Cookie value, <= 16384 bytes. */
+} ttp_https_exchange_request;
+typedef struct ttp_https_exchange_response {
+    uint32_t size;
+    ttp_https_response response;
+    uint32_t http_status;
+    const char *location;
+    const char *const *set_cookies;
+    uint32_t cookie_count;
+} ttp_https_exchange_response;
+typedef struct ttp_https_api_v5 {
+    ttp_https_api_v4 base;
+    int (__cdecl *exchange)(const ttp_https_exchange_request *, ttp_https_exchange_response *, char *, size_t);
+    void (__cdecl *release_exchange)(ttp_https_exchange_response *);
+} ttp_https_api_v5;
+
+/* ABI 6 preserves every earlier table and structure. One exchange, with
+   caller-controlled headers and response metadata needed for full-file checks.
+   ALL reads bounded bodies for all statuses; SUCCESS reads only 2xx bodies.
+   HTTP statuses that cannot have a body always complete at the header boundary.
+   Optional header values are printable ASCII, <= 512 bytes (Referer <= 8192).
+   NULL UA/Accept retain the defaults; NULL/empty Referer omits that header. */
+#define TTP_HTTPS_EXCHANGE_EX_ABI_VERSION 6u
+#define TTP_HTTPS_BODY_ALL 0u
+#define TTP_HTTPS_BODY_SUCCESS 1u
+typedef struct ttp_https_exchange_ex_request {
+    uint32_t size;
+    ttp_https_exchange_request exchange;
+    const char *user_agent;
+    const char *accept;
+    const char *referer;
+    uint32_t body_policy;
+} ttp_https_exchange_ex_request;
+typedef struct ttp_https_exchange_ex_response {
+    uint32_t size;
+    ttp_https_exchange_response exchange;
+    const char *content_range; /* Raw Content-Range, or empty. Same ownership. */
+} ttp_https_exchange_ex_response;
+typedef struct ttp_https_api_v6 {
+    ttp_https_api_v5 base;
+    int (__cdecl *exchange_ex)(const ttp_https_exchange_ex_request *, ttp_https_exchange_ex_response *, char *, size_t);
+    void (__cdecl *release_exchange_ex)(ttp_https_exchange_ex_response *);
+} ttp_https_api_v6;
+
+/* ABI 7: pull-based HTTP/HTTPS media transport. One response per handle;
+   redirects are returned to the caller. No body/file size or lifetime limit.
+   open/read run on a caller-owned worker; close must not race another call.
+   Request strings and CA bytes are copied. The cancellation callback/context
+   must remain alive through close. Headers live until close. A successful
+   read with zero bytes is EOF; short positive reads are NOT EOF. */
+#define TTP_HTTPS_STREAM_ABI_VERSION 7u
+#define TTP_HTTPS_TIMEOUT (-3)
+#define TTP_HTTPS_TRUNCATED (-4)
+typedef struct ttp_https_stream ttp_https_stream;
+typedef struct ttp_https_stream_request {
+    uint32_t size;
+    ttp_https_request request;
+    uint64_t offset;
+    const char *if_range; /* Optional strong ETag or Last-Modified, <= 512 bytes. */
+    uint32_t timeout_ms; /* Per open/read idle budget, 100..60000; 0 -> 15000. */
+    int32_t icy_metadata;
+    /* Optional explicit PAC configuration for a caller with its own settings.
+       NULL and -1 use current-user IE settings. No registry writes. */
+    const wchar_t *auto_config_url;
+    int32_t auto_detect;
+} ttp_https_stream_request;
+typedef struct ttp_https_api_v7 {
+    ttp_https_api_v6 base;
+    int (__cdecl *stream_open)(const ttp_https_stream_request *, ttp_https_stream **,
+        uint32_t *http_status, char *error, size_t error_size);
+    const char *(__cdecl *stream_header)(ttp_https_stream *, const char *lowercase_name);
+    int (__cdecl *stream_read)(ttp_https_stream *, void *, uint32_t capacity,
+        uint32_t *read, char *error, size_t error_size);
+    void (__cdecl *stream_close)(ttp_https_stream *);
+} ttp_https_api_v7;
+
 /* All pointers in the response remain valid until release(). No C++ objects,
    exceptions or CRT ownership cross the ABI. Independent calls may run in
    parallel. Keep the DLL loaded until every call and response is finished. */

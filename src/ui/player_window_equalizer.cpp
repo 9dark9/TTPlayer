@@ -23,7 +23,6 @@ namespace {
 std::vector<skin::SkinLayer> EqualizerLayers(const skin::EqualizerSkin& layout) {
     std::vector<skin::SkinLayer> layers;
     const auto add = [&](const skin::SkinElement& e, int id) {
-        if (!e.image && !e.bar_image && !e.fill_image && !e.thumb_image) return;
         const auto size = layout.background.size;
         const RECT bounds = ResolveAlignedRect(e.bounds, e.alignment, size, size.cx, size.cy);
         if (!IsRectEmpty(&bounds)) layers.push_back({&e, bounds, id});
@@ -46,6 +45,27 @@ LRESULT PlayerWindow::HandleEqualizerControlMessage(HWND control, UINT message,
                                                      WPARAM wparam,
                                                      LPARAM lparam) {
     const HWND parent = GetParent(control);
+    const auto item = std::find_if(equalizer_controls_.begin(), equalizer_controls_.end(),
+        [control](const auto& value) { return value.second == control; });
+    const int hit = item == equalizer_controls_.end() ? 0 : item->first;
+    if (hit == kEqHitEnabled || hit == kEqHitProfile || hit == kEqHitReset || hit == kEqHitClose) {
+        if (message == WM_NCDESTROY) native_skin_buttons_.erase(control);
+        else {
+            const auto previous = native_skin_buttons_[control];
+            auto& button = NativeSkinButton(control,
+                hit == kEqHitEnabled && settings_.equalizer.profile != -2);
+            bool invoke{};
+            if (skin::HandleSkinButtonInput(control, button, message, wparam, lparam, invoke)) {
+                if (previous != button) InvalidateRect(control, nullptr, TRUE);
+                if (invoke) {
+                    POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                    ClientToScreen(control, &point);
+                    InvokeEqualizerControl(hit, point);
+                }
+                return 0;
+            }
+        }
+    }
     const auto forward_point = [&](UINT forwarded) {
         POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
         MapWindowPoints(control, parent, &point, 1);
@@ -61,7 +81,15 @@ LRESULT PlayerWindow::HandleEqualizerControlMessage(HWND control, UINT message,
         // child rectangles.  Native SkinButton/SkinSlider windows have no
         // class brush, so validating without erasing preserves that surface.
         PAINTSTRUCT paint{};
-        BeginPaint(control, &paint);
+        const HDC dc = BeginPaint(control, &paint);
+        if (hit == kEqHitEnabled || hit == kEqHitProfile || hit == kEqHitReset || hit == kEqHitClose) {
+            const int saved = SaveDC(dc);
+            POINT origin{};
+            MapWindowPoints(control, parent, &origin, 1);
+            SetViewportOrgEx(dc, -origin.x, -origin.y, nullptr);
+            PaintEqualizer(dc);
+            if (saved) RestoreDC(dc, saved);
+        }
         EndPaint(control, &paint);
         return 0;
     }
@@ -72,8 +100,9 @@ LRESULT PlayerWindow::HandleEqualizerControlMessage(HWND control, UINT message,
         SetFocus(control);
         return forward_point(message);
     case WM_LBUTTONUP:
-    case WM_LBUTTONDBLCLK:
         return forward_point(message);
+    case WM_LBUTTONDBLCLK:
+        return forward_point(WM_LBUTTONDOWN);
     case WM_MOUSELEAVE:
     case WM_CAPTURECHANGED:
     case WM_CANCELMODE:
@@ -101,6 +130,7 @@ LRESULT PlayerWindow::HandleEqualizerControlMessage(HWND control, UINT message,
 
 LRESULT PlayerWindow::HandleEqualizerMessage(UINT message, WPARAM wparam,
                                               LPARAM lparam) {
+    if (HandleEqualizerSliderMessage(message, wparam, lparam)) return 0;
     const auto is_slider = [](int hit) {
         return hit == kEqSliderBalance || hit == kEqSliderSurround ||
                hit == kEqSliderPreamp ||
@@ -160,28 +190,17 @@ LRESULT PlayerWindow::HandleEqualizerMessage(UINT message, WPARAM wparam,
             ContinueSkinBackgroundDrag(equalizer_window_, point);
             return 0;
         }
-        if (equalizer_active_slider_ &&
-            EqualizerHasCapture(equalizer_active_slider_)) {
-            SetEqualizerSliderFromPoint(equalizer_active_slider_, point, true);
-            return 0;
-        }
-        if (equalizer_track_capture_slider_ &&
-            EqualizerHasCapture(equalizer_track_capture_slider_)) {
-            const RECT thumb = EqualizerSliderThumbRect(
-                equalizer_track_capture_slider_);
-            if (!PtInRect(&thumb, point)) {
-                equalizer_track_capture_slider_ = 0;
-                ReleaseEqualizerCapture();
-                equalizer_hover_ = 0;
-                InvalidateRect(equalizer_window_, nullptr, FALSE);
-                return 0;
-            }
-        }
         int hit = EqualizerHitTest(point);
         if (is_slider(hit)) {
             const RECT thumb = EqualizerSliderThumbRect(hit);
             if (!PtInRect(&thumb, point)) hit = 0;
         }
+        // After capture is transferred from a SkinButton to the equalizer
+        // parent, native child input no longer reaches that button. Do not
+        // manufacture a new child hover/capture from the parent's MOVE.
+        if (!equalizer_pressed_ && GetCapture() == equalizer_window_ &&
+            hit != 0 && !is_slider(hit) && EqualizerControlWindow(hit))
+            return 0;
         // FUN_00452326 captures a slider as soon as the pointer enters its
         // thumb and retains that capture until the pointer leaves.  Capture
         // is also what selects the second (hot) frame in FUN_00451F59.
@@ -240,34 +259,6 @@ LRESULT PlayerWindow::HandleEqualizerMessage(UINT message, WPARAM wparam,
         if (!hit) {
             equalizer_pressed_ = 0;
             BeginSkinBackgroundDrag(equalizer_window_, point);
-        } else if (is_slider(hit)) {
-            const RECT thumb = EqualizerSliderThumbRect(hit);
-            const bool vertical = skin_ && (hit == kEqSliderPreamp ||
-                (hit >= kEqSliderFirstBand && hit <= kEqSliderLastBand) ||
-                (hit == kEqSliderSurround && skin_->Equalizer().surround.vertical) ||
-                (hit == kEqSliderBalance && skin_->Equalizer().balance.vertical));
-            equalizer_focused_slider_ = hit;
-            equalizer_pressed_ = 0;
-            equalizer_slider_initial_value_ = EqualizerSliderValue(hit);
-            if (const HWND control = EqualizerControlWindow(hit))
-                SetFocus(control);
-            else
-                SetFocus(equalizer_window_);
-            if (PtInRect(&thumb, point)) {
-                equalizer_slider_drag_offset_ = vertical
-                    ? point.y - thumb.top : point.x - thumb.left;
-                CaptureEqualizerControl(hit);
-                equalizer_active_slider_ = hit;
-                equalizer_track_capture_slider_ = 0;
-            } else {
-                equalizer_slider_drag_offset_ = vertical
-                    ? (thumb.bottom - thumb.top) / 2
-                    : (thumb.right - thumb.left) / 2;
-                SetEqualizerSliderFromPoint(hit, point, false);
-                CaptureEqualizerControl(hit);
-                equalizer_active_slider_ = 0;
-                equalizer_track_capture_slider_ = hit;
-            }
         } else {
             CaptureEqualizerControl(hit);
             equalizer_hover_ = hit;
@@ -278,37 +269,6 @@ LRESULT PlayerWindow::HandleEqualizerMessage(UINT message, WPARAM wparam,
     }
     case WM_LBUTTONUP: {
         const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-        if (equalizer_active_slider_) {
-            const int slider = equalizer_active_slider_;
-            equalizer_active_slider_ = 0;
-            equalizer_pressed_ = 0;
-            ReleaseEqualizerCapture();
-            // FUN_00452295 sends SB_THUMBPOSITION (4); FUN_00460AB1
-            // restores CPlayerWnd's stored playback status before the
-            // equalizer commits its final value/profile state.
-            SetEqualizerTrackingStatus(slider, false);
-            // FUN_00452295 sends the final SB_THUMBPOSITION even when the
-            // pointer never moved; CEqualizerWnd consequently changes a
-            // named profile to Custom on a simple thumb click as well.
-            SetEqualizerSliderValue(slider, EqualizerSliderValue(slider), true);
-            InvalidateRect(equalizer_window_, nullptr, FALSE);
-            return 0;
-        }
-        if (equalizer_track_capture_slider_) {
-            const int slider = equalizer_track_capture_slider_;
-            const RECT thumb = EqualizerSliderThumbRect(slider);
-            if (PtInRect(&thumb, point)) {
-                // FUN_00452295 leaves the non-pressed hover capture in place
-                // when release is still over the thumb.
-                equalizer_hover_ = slider;
-            } else {
-                equalizer_track_capture_slider_ = 0;
-                equalizer_hover_ = 0;
-                ReleaseEqualizerCapture();
-            }
-            InvalidateRect(equalizer_window_, nullptr, FALSE);
-            return 0;
-        }
         const int released = EqualizerHitTest(point);
         const int control = std::exchange(equalizer_pressed_, 0);
         if (dragging_skin_background_ && skin_drag_window_ == equalizer_window_)
@@ -322,50 +282,8 @@ LRESULT PlayerWindow::HandleEqualizerMessage(UINT message, WPARAM wparam,
         InvalidateRect(equalizer_window_, nullptr, FALSE);
         return 0;
     }
-    case WM_KEYDOWN:
-        if (wparam == VK_ESCAPE &&
-            (equalizer_active_slider_ || equalizer_track_capture_slider_)) {
-            const int slider = equalizer_active_slider_
-                ? equalizer_active_slider_ : equalizer_track_capture_slider_;
-            SetEqualizerSliderValue(slider,
-                                    equalizer_slider_initial_value_, true);
-            equalizer_active_slider_ = 0;
-            equalizer_track_capture_slider_ = 0;
-            equalizer_pressed_ = 0;
-            ReleaseEqualizerCapture();
-            return 0;
-        }
-        if ((wparam == VK_LEFT || wparam == VK_RIGHT ||
-             wparam == VK_UP || wparam == VK_DOWN) &&
-            is_slider(equalizer_focused_slider_)) {
-            bool vertical = equalizer_focused_slider_ == kEqSliderPreamp ||
-                (equalizer_focused_slider_ >= kEqSliderFirstBand &&
-                 equalizer_focused_slider_ <= kEqSliderLastBand);
-            if (skin_ && equalizer_focused_slider_ == kEqSliderBalance)
-                vertical = skin_->Equalizer().balance.vertical;
-            if (skin_ && equalizer_focused_slider_ == kEqSliderSurround)
-                vertical = skin_->Equalizer().surround.vertical;
-            if ((vertical && wparam != VK_UP && wparam != VK_DOWN) ||
-                (!vertical && wparam != VK_LEFT && wparam != VK_RIGHT))
-                return 0;
-            const bool increase = wparam == VK_RIGHT || wparam == VK_UP;
-            const int slider = equalizer_focused_slider_;
-            const int minimum = slider == kEqSliderBalance ? -10 :
-                slider == kEqSliderSurround ? 0 : -12;
-            const int maximum = slider == kEqSliderBalance ? 10 :
-                slider == kEqSliderSurround ? 16 : 12;
-            const int value = std::clamp(EqualizerSliderValue(slider) +
-                (increase ? 1 : -1), minimum, maximum);
-            // 00452413 sends no notification when a key hits the limit.
-            if (value == EqualizerSliderValue(slider)) return 0;
-            // FUN_00452413 reports keyboard changes as SB_THUMBPOSITION,
-            // which restores rather than replaces the main status text.
-            SetEqualizerTrackingStatus(equalizer_focused_slider_, false);
-            SetEqualizerSliderValue(slider, value, true);
-            return 0;
-        }
-        break;
     case WM_CAPTURECHANGED:
+        for (auto& [slider, state] : equalizer_slider_states_) state.Cancel();
         if (skin_drag_window_ == equalizer_window_) EndSkinMouseCapture();
         SetEqualizerTrackingStatus(0, false);
         equalizer_active_slider_ = 0;
@@ -374,9 +292,7 @@ LRESULT PlayerWindow::HandleEqualizerMessage(UINT message, WPARAM wparam,
         InvalidateRect(equalizer_window_, nullptr, FALSE);
         return 0;
     case WM_CANCELMODE:
-        if (equalizer_active_slider_)
-            SetEqualizerSliderValue(equalizer_active_slider_,
-                                    equalizer_slider_initial_value_, true);
+        for (auto& [slider, state] : equalizer_slider_states_) state.Cancel();
         equalizer_active_slider_ = 0;
         equalizer_track_capture_slider_ = 0;
         equalizer_pressed_ = 0;
@@ -456,10 +372,8 @@ void PlayerWindow::CreateEqualizerControls() {
                                const skin::SkinElement& element,
                                const wchar_t* class_name) {
         const bool slider = class_name == kEqualizerSliderClass;
-        const bool present = !((!slider && !element.image) ||
-            (slider && !element.thumb_image && !element.fill_image &&
-             !element.bar_image));
         const RECT bounds = EqualizerElementBounds(element);
+        const bool present = !IsRectEmpty(&bounds);
         const auto found = std::find_if(equalizer_controls_.begin(), equalizer_controls_.end(),
             [hit](const auto& entry) { return entry.first == hit; });
         HWND control = found == equalizer_controls_.end() ? nullptr : found->second;
@@ -690,48 +604,90 @@ void PlayerWindow::ReleaseEqualizerCapture() {
     if (EqualizerOwnsCapture()) ReleaseCapture();
 }
 
-RECT PlayerWindow::EqualizerSliderThumbRect(int slider) const {
-    if (!skin_) return {};
+std::optional<skin::SkinSliderGeometry> PlayerWindow::EqualizerSliderGeometry(int slider) const {
+    if (!skin_) return std::nullopt;
     const auto& layout = skin_->Equalizer();
-    const skin::SkinElement* element = nullptr;
-    int minimum{};
-    int maximum{};
+    const skin::SkinElement* element{};
+    int minimum{}, maximum{};
     if (slider == kEqSliderBalance) {
         element = &layout.balance; minimum = -10; maximum = 10;
     } else if (slider == kEqSliderSurround) {
-        element = &layout.surround; minimum = 0; maximum = 16;
+        element = &layout.surround; maximum = 16;
     } else if (slider == kEqSliderPreamp) {
         element = &layout.preamp; minimum = -12; maximum = 12;
     } else if (slider >= kEqSliderFirstBand && slider <= kEqSliderLastBand) {
         element = &layout.bands[static_cast<size_t>(slider - kEqSliderFirstBand)];
         minimum = -12; maximum = 12;
     }
-    if (!element || (!element->thumb_image && !element->fill_image &&
-                     !element->bar_image)) return {};
-    const RECT bounds = EqualizerElementBounds(*element);
-    const int thumb_width = element->thumb_image
-        ? std::max(1L, element->thumb_size.cx / 4) : 1;
-    const int thumb_height = element->thumb_image
-        ? std::max(1L, element->thumb_size.cy) : 1;
-    const int value = std::clamp(EqualizerSliderValue(slider), minimum, maximum);
-    if (element->vertical) {
-        const int travel = std::max(0L, bounds.bottom - bounds.top - 2 - thumb_height);
-        const int top = bounds.top + 1 +
-            MulDiv(maximum - value, travel, maximum - minimum);
-        const int left = bounds.left + (bounds.right - bounds.left - thumb_width) / 2;
-        return {left, top, left + thumb_width, top + thumb_height};
+    if (!element) return std::nullopt;
+    return skin::SkinSliderGeometry{EqualizerElementBounds(*element), minimum, maximum,
+        element->thumb_image ? static_cast<int>(element->vertical ? element->thumb_size.cy : element->thumb_size.cx / 4) : 1,
+        element->vertical};
+}
+
+RECT PlayerWindow::EqualizerSliderThumbRect(int slider) const {
+    const auto geometry = EqualizerSliderGeometry(slider);
+    return geometry ? geometry->Thumb(EqualizerSliderValue(slider)) : RECT{};
+}
+
+bool PlayerWindow::HandleEqualizerSliderMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message != WM_MOUSEMOVE && message != WM_LBUTTONDOWN && message != WM_LBUTTONUP &&
+        message != WM_KEYDOWN) return false;
+    if (dragging_skin_background_ || equalizer_pressed_) return false;
+    const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+    int slider = equalizer_active_slider_ ? equalizer_active_slider_ : equalizer_track_capture_slider_;
+    if (message == WM_KEYDOWN) slider = equalizer_focused_slider_;
+    else if (!slider) {
+        if (message == WM_LBUTTONUP) return false;
+        slider = EqualizerHitTest(point);
     }
-    const int travel = std::max(0L, bounds.right - bounds.left - 2 - thumb_width);
-    const int left = bounds.left + 1 +
-        MulDiv(value - minimum, travel, maximum - minimum);
-    const int top = bounds.top + (bounds.bottom - bounds.top - thumb_height) / 2;
-    return {left, top, left + thumb_width, top + thumb_height};
+    const auto geometry = EqualizerSliderGeometry(slider);
+    if (!geometry || IsRectEmpty(&geometry->bounds)) return false;
+    const HWND control = EqualizerControlWindow(slider);
+    if (control && !IsWindowEnabled(control)) return false;
+    auto state = equalizer_slider_states_[slider];
+    state.Sync(*geometry, EqualizerSliderValue(slider));
+    const bool had_capture = (equalizer_active_slider_ == slider ||
+        equalizer_track_capture_slider_ == slider) && EqualizerHasCapture(slider);
+    skin::SkinSliderEvent event;
+    if (message == WM_LBUTTONDOWN) {
+        equalizer_focused_slider_ = slider;
+        SetFocus(control ? control : equalizer_window_);
+        event = state.Down(*geometry, point);
+    } else if (message == WM_MOUSEMOVE) event = state.Move(*geometry, point);
+    else if (message == WM_LBUTTONUP) event = state.Up(*geometry, point);
+    else {
+        event = state.Key(*geometry, static_cast<UINT>(wparam));
+        // Consume a handled key even if clamping leaves the value unchanged.
+        if (event.notification < 0 && wparam != VK_ESCAPE && wparam != VK_LEFT &&
+            wparam != VK_RIGHT && wparam != VK_UP && wparam != VK_DOWN) return false;
+    }
+    if (state.captured && !EqualizerHasCapture(slider)) CaptureEqualizerControl(slider);
+    else if (!state.captured && had_capture) ReleaseEqualizerCapture();
+    // Capture can synchronously cancel the old child; commit this child's state after it.
+    equalizer_slider_states_[slider] = state;
+    equalizer_active_slider_ = state.dragging ? slider : 0;
+    equalizer_track_capture_slider_ = state.captured && !state.dragging ? slider : 0;
+    equalizer_hover_ = state.captured ? slider : 0;
+    equalizer_slider_initial_value_ = state.initial;
+    if (event.notification >= 0) {
+        SetEqualizerSliderValue(slider, state.value, true);
+        SetEqualizerTrackingStatus(slider, event.notification != SB_THUMBPOSITION);
+    }
+    if (event.redraw) InvalidateRect(equalizer_window_, nullptr, FALSE);
+    return true;
 }
 
 int PlayerWindow::EqualizerHitTest(POINT point) const {
     if (!skin_ || !skin_->Equalizer().valid) return 0;
     const skin::SkinLayers layers(EqualizerLayers(skin_->Equalizer()), skin_->TransparentColor());
-    if (const auto* hit = layers.Hit(point)) return hit->id;
+    if (const auto* hit = layers.Hit(point)) {
+        // User32 routes input over a disabled child to its parent. The
+        // parent's fallback hit test must not capture/invoke that child
+        // again, or a click clears its disabled frame and may toggle it.
+        const HWND control = EqualizerControlWindow(hit->id);
+        return control && !IsWindowEnabled(control) ? 0 : hit->id;
+    }
     return 0;
 }
 
@@ -748,6 +704,9 @@ void PlayerWindow::PaintEqualizer(HDC dc) const {
     layout.background.image.Draw(canvas, 0, 0, size.cx, size.cy, 0, 0, size.cx, size.cy);
 
     const auto button_state = [this](int hit, bool checked = false) {
+        if (const HWND control = EqualizerControlWindow(hit);
+            control && native_skin_buttons_.contains(control))
+            return NativeSkinButton(control, checked).Frame();
         if (equalizer_pressed_ == hit && equalizer_hover_ == hit &&
             EqualizerHasCapture(hit)) return 2;
         if (checked) return 2;
@@ -818,13 +777,17 @@ void PlayerWindow::PaintEqualizer(HDC dc) const {
                     element.fill_size.cy, skin_->TransparentColor());
             }
         }
-        if (element.thumb_image && thumb.right > thumb.left && thumb.bottom > thumb.top) {
-            const int frame_width = std::max(1L, element.thumb_size.cx / 4);
+        if (element.thumb_image && !IsRectEmpty(&bounds)) {
+            const int frame_width = element.thumb_size.cx / 4;
+            const int paint_width = !frame_width && !element.thumb_image.IsGdiPlus()
+                ? element.thumb_size.cx : frame_width;
             int frame = disabled ? 3 : equalizer_active_slider_ == slider ? 2 :
                         equalizer_hover_ == slider ? 1 : 0;
-            element.thumb_image.Draw(canvas, thumb.left, thumb.top,
-                thumb.right - thumb.left, thumb.bottom - thumb.top,
-                frame * frame_width, 0, frame_width,
+            element.thumb_image.Draw(canvas,
+                thumb.left + (thumb.right - thumb.left - frame_width) / 2,
+                thumb.top + (thumb.bottom - thumb.top - element.thumb_size.cy) / 2,
+                paint_width, element.thumb_size.cy,
+                frame * frame_width, 0, paint_width,
                 element.thumb_size.cy, skin_->TransparentColor());
         }
     };
@@ -873,70 +836,17 @@ void PlayerWindow::UpdateEqualizerUserProfile() {
     }
 }
 
-void PlayerWindow::SetEqualizerSliderFromPoint(int slider, POINT point,
-                                                bool tracking) {
-    if (!skin_) return;
-    const auto& layout = skin_->Equalizer();
-    const skin::SkinElement* element = nullptr;
-    int minimum{};
-    int maximum{};
-    if (slider == kEqSliderBalance) {
-        element = &layout.balance; minimum = -10; maximum = 10;
-    } else if (slider == kEqSliderSurround) {
-        element = &layout.surround; minimum = 0; maximum = 16;
-    } else if (slider == kEqSliderPreamp) {
-        element = &layout.preamp; minimum = -12; maximum = 12;
-    } else if (slider >= kEqSliderFirstBand && slider <= kEqSliderLastBand) {
-        element = &layout.bands[static_cast<size_t>(slider - kEqSliderFirstBand)];
-        minimum = -12; maximum = 12;
-    }
-    if (!element || (!element->thumb_image && !element->fill_image &&
-                     !element->bar_image)) return;
-    const RECT bounds = EqualizerElementBounds(*element);
-    const int thumb_width = element->thumb_image
-        ? std::max(1L, element->thumb_size.cx / 4) : 1;
-    const int thumb_height = element->thumb_image
-        ? std::max(1L, element->thumb_size.cy) : 1;
-    // FUN_00452326 first converts the pointer/press offset to the thumb
-    // centre, then FUN_00452045 maps that centre through its own client
-    // interval.  That input interval is deliberately not the same as the
-    // paint travel in FUN_00428F41: vertical input does not apply the
-    // one-pixel inset, and the half-thumb arithmetic keeps the odd-pixel
-    // rounding.  Reusing the paint travel here makes a default-band drag land
-    // at +10 where the 5.7.9 binary lands at +9.
-    int value{};
-    if (element->vertical) {
-        const int half = thumb_height / 2;
-        const int first = bounds.top + half;
-        const int last = bounds.bottom + half - thumb_height;
-        const int interval = last - first < 2 ? 1 : last - first;
-        const int centre = point.y + half - equalizer_slider_drag_offset_;
-        value = maximum - MulDiv(centre - first,
-                                 maximum - minimum, interval);
-    } else {
-        const int half = thumb_width / 2;
-        const int first = bounds.left + 1 + half;
-        const int last = bounds.right - 1 + half - thumb_width;
-        const int interval = last - first < 2 ? 1 : last - first;
-        const int centre = point.x + half - equalizer_slider_drag_offset_;
-        value = minimum + MulDiv(centre - first,
-                                 maximum - minimum, interval);
-    }
-    const int previous = EqualizerSliderValue(slider);
-    value = std::clamp(value, minimum, maximum);
-    // 00452326 notifies only after the mapped value changes. A mouse move
-    // within the same step must not advance the Profile/Custom state machine.
-    if (tracking && value == previous) return;
-    SetEqualizerSliderValue(slider, value, true);
+void PlayerWindow::SetEqualizerSliderFromPoint(int slider, POINT point, bool tracking) {
+    const auto geometry = EqualizerSliderGeometry(slider);
+    if (!geometry) return;
     if (tracking) {
-        // FUN_00452326 sends SB_THUMBTRACK only when mapping changed value.
-        if (EqualizerSliderValue(slider) != previous)
-            SetEqualizerTrackingStatus(slider, true);
-    } else {
-        // A track click is SB_THUMBPOSITION, so the main window keeps its
-        // stored playback status instead of showing a temporary value.
-        SetEqualizerTrackingStatus(slider, false);
+        if (geometry->vertical) point.y += geometry->extent / 2 - equalizer_slider_drag_offset_;
+        else point.x += geometry->extent / 2 - equalizer_slider_drag_offset_;
     }
+    const int value = geometry->ValueAt(point);
+    if (tracking && value == EqualizerSliderValue(slider)) return;
+    SetEqualizerSliderValue(slider, value, true);
+    SetEqualizerTrackingStatus(slider, tracking);
 }
 
 void PlayerWindow::ApplyEqualizer() {

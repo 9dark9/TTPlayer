@@ -17,6 +17,9 @@
 #include "ttplayer/audio/kernel_streaming_sink.h"
 #include "ttplayer/audio/mp3pro_source.h"
 #include "ttplayer/audio/legacy_windows_source.h"
+#include "ttplayer/audio/http_stream.h"
+#include "ttplayer/audio/http_download_queue.h"
+#include "ttplayer/audio/http_mpeg_source.h"
 #include "ttplayer/audio/pcm_output_transform.h"
 #include "ttplayer/audio/replay_gain_policy.h"
 #include "ttplayer/audio/replay_gain_scanner.h"
@@ -206,8 +209,8 @@ std::optional<double> MetadataNumber(std::wstring_view value) {
 
 class MediaFoundationSource final : public DecodedAudioSource {
 public:
-    explicit MediaFoundationSource(HMODULE ttpcomm = nullptr)
-        : ttpcomm_(ttpcomm) {}
+    explicit MediaFoundationSource(HMODULE ttpcomm = nullptr, IStream* input = nullptr)
+        : ttpcomm_(ttpcomm), archive_stream_(input) {}
 
     bool Open(const std::filesystem::path& path,
               const PlaybackOptions&) override {
@@ -216,7 +219,11 @@ public:
         if (SUCCEEDED(result)) {
             attributes->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, FALSE);
             ArchiveMemberPath member;
-            if (ParseArchiveMemberPath(path.native(), member)) {
+            if (archive_stream_) {
+                result = platform::MFCreateMFByteStreamOnStream(archive_stream_.Get(), &archive_byte_stream_);
+                if (SUCCEEDED(result)) result = platform::MFCreateSourceReaderFromByteStream(
+                    archive_byte_stream_.Get(), attributes.Get(), &reader_);
+            } else if (ParseArchiveMemberPath(path.native(), member)) {
                 try {
                     archive_stream_.Attach(OpenArchiveMemberStream(member, ttpcomm_));
                     if (!archive_stream_) {
@@ -323,7 +330,7 @@ public:
         display_format_.bits_per_sample = wave_format_.wBitsPerSample;
         display_format_.codec_name = CodecNameFromTag(native_subtype.Data1, path);
         ArchiveMemberPath member;
-        if (!ParseArchiveMemberPath(path.native(), member)) {
+        if (!AudioEngine::IsNetworkMediaLocation(path) && !ParseArchiveMemberPath(path.native(), member)) {
             ComPtr<IPropertyStore> properties;
             if (SUCCEEDED(platform::SHGetPropertyStoreFromParsingName(
                     path.c_str(), nullptr, GPS_DEFAULT,
@@ -476,8 +483,15 @@ public:
         const PROPERTYKEY key{MFNETSOURCE_STATISTICS, MFNETSOURCE_DOWNLOADPROGRESS_ID};
         PROPVARIANT value{};
         downloaded_percent_ = -1;
-        if (SUCCEEDED(network_statistics_->GetValue(key, &value)) && value.vt == VT_I4 &&
-            value.lVal >= 0 && value.lVal <= 100) downloaded_percent_ = value.lVal;
+        if (SUCCEEDED(network_statistics_->GetValue(key, &value))) {
+            // The HTTP network source returns VT_UI4 (also on Windows 7).
+            // Accept the signed form used by other providers, but preserve
+            // unknown/invalid values instead of painting a made-up percentage.
+            if (value.vt == VT_UI4 && value.ulVal <= 100)
+                downloaded_percent_ = static_cast<int>(value.ulVal);
+            else if (value.vt == VT_I4 && value.lVal >= 0 && value.lVal <= 100)
+                downloaded_percent_ = value.lVal;
+        }
         PropVariantClear(&value);
         return downloaded_percent_;
     }
@@ -517,15 +531,16 @@ public:
         }
         return result;
     }
-    LegacyPluginSource(const plugins::PluginManager& manager, HMODULE ttpcomm)
-        : manager_(manager), ttpcomm_(ttpcomm) {}
+    LegacyPluginSource(const plugins::PluginManager& manager, HMODULE ttpcomm, IStream* input = nullptr)
+        : manager_(manager), ttpcomm_(ttpcomm), network_input_(input) {}
 
     bool Open(const std::filesystem::path& path,
               const PlaybackOptions&) override {
         HRESULT result{};
         std::wstring diagnostic;
         ArchiveMemberPath member;
-        if (ParseArchiveMemberPath(path.native(), member)) {
+        if (network_input_) reader_ = manager_.OpenReader(path, network_input_.Get(), &result, &diagnostic);
+        else if (ParseArchiveMemberPath(path.native(), member)) {
             try {
                 ComPtr<IStream> stream;
                 stream.Attach(OpenArchiveMemberStream(member, ttpcomm_));
@@ -661,6 +676,7 @@ private:
 
     const plugins::PluginManager& manager_;
     HMODULE ttpcomm_{};
+    ComPtr<IStream> network_input_;
     std::unique_ptr<plugins::LegacyReaderSession> reader_;
     AudioFormat display_format_{};
     std::chrono::milliseconds duration_{};
@@ -675,7 +691,9 @@ private:
 // a whole archive member into another memory buffer or named extraction file.
 class PcmInputStream {
 public:
+    explicit PcmInputStream(IStream* input = nullptr) : member_(input) {}
     void Open(const std::filesystem::path& path, HMODULE comm) {
+        if (member_) return;
         ArchiveMemberPath member;
         if (ParseArchiveMemberPath(path.native(), member))
             member_.Attach(OpenArchiveMemberStream(member, comm));
@@ -717,7 +735,8 @@ private:
 
 class PcmFileSource final : public DecodedAudioSource {
 public:
-    explicit PcmFileSource(HMODULE comm) : ttpcomm_(comm) {}
+    explicit PcmFileSource(HMODULE comm, IStream* input = nullptr)
+        : ttpcomm_(comm), stream_(input) {}
     bool Open(const std::filesystem::path& path,
               const PlaybackOptions&) override {
         try { stream_.Open(path,ttpcomm_); }
@@ -1165,13 +1184,104 @@ private:
     std::wstring error_; HRESULT result_{E_FAIL};
 };
 
+class HttpSource final : public DecodedAudioSource {
+public:
+    HttpSource(const plugins::PluginManager* manager, HMODULE comm) : manager_(manager), comm_(comm) {}
+    bool Open(const std::filesystem::path& path, const PlaybackOptions& options) override {
+        // 004CFB25 checks the saved copy before requesting the network task.
+        // Never use cachelist/temp: legacy producers preallocated incomplete files.
+        for(const auto& list : {options.network_download_list,
+             options.network_cache_folder / L"cachelist.xml",
+             options.network_download_folder / L"cachelist.xml"}) {
+            if(list.empty() || !list.is_absolute()) continue;
+            const auto saved=ResolveLegacySavedFile(ReadLegacyCacheList(list),path.native(),
+                {options.network_download_folder, options.network_cache_folder});
+            if(saved.empty()) continue;
+            auto next=std::make_unique<RecoveredFileSource>(manager_,comm_);
+            if(next->Open(saved,options)){source_=std::move(next);result_=S_OK;return true;}
+        }
+        result_ = OpenHttpAudioStream(path.native(), options, &stream_);
+        if (FAILED(result_)) return false;
+        auto decoder_path = path;
+        auto attempt = [&](std::unique_ptr<DecodedAudioSource> next) {
+            if (FAILED(stream_->LastError())) { result_ = stream_->LastError(); return false; }
+            LARGE_INTEGER zero{};
+            result_ = stream_->Seek(zero, STREAM_SEEK_SET, nullptr);
+            if (FAILED(result_)) return false;
+            const bool opened = next->Open(decoder_path, options);
+            result_ = (stream_ && FAILED(stream_->LastError())) ? stream_->LastError() : opened ? S_OK : next->ErrorResult();
+            if (!opened && SUCCEEDED(result_)) result_ = E_FAIL;
+            if (FAILED(result_)) return false;
+            source_ = std::move(next); return true;
+        };
+        STATSTG stat{};
+        if (stream_->Stat(&stat, STATFLAG_NONAME) == E_PENDING) {
+            std::array<unsigned char,16> header{};ULONG got{};
+            result_=stream_->Read(header.data(),static_cast<ULONG>(header.size()),&got);
+            if(FAILED(result_)) return false;
+            const auto extension=RecoverAudioFormatHint(AudioExtensionHint(path),{header.data(),got});
+            decoder_path.replace_extension(extension);
+            if(extension==L".mp3" || extension==L".mp2" || extension==L".mp1")
+                return attempt(CreateHttpMpegSource(comm_, stream_.Get()));
+            if((extension==L".ogg" || extension==L".opus" || extension==L".aac") && manager_ &&
+                attempt(std::make_unique<LegacyPluginSource>(*manager_,comm_,stream_.Get()))) return true;
+            // Finite containers whose index is at the end need a complete
+            // response before their ordinary seek-based reader can open.
+            result_=stream_->BufferToEnd(256ULL*1024*1024);
+            if(FAILED(result_)) return false;
+        }
+        // XP's Windows Media reader does not accept WAV through OpenStream.
+        // Reuse the file/archive PCM parser for this same seekable IStream.
+        if (attempt(std::make_unique<PcmFileSource>(comm_, stream_.Get()))) return true;
+        if (manager_ && attempt(std::make_unique<LegacyPluginSource>(*manager_, comm_, stream_.Get()))) return true;
+        return platform::HasMediaFoundation()
+            ? attempt(std::make_unique<MediaFoundationSource>(comm_, stream_.Get()))
+            : attempt(CreateLegacyWindowsSource(comm_, stream_.Get()));
+    }
+    bool Read(size_t size, std::vector<std::byte>& out, bool& end) override {
+        const bool ok = source_->Read(size, out, end);
+        result_ = (stream_ && FAILED(stream_->LastError())) ? stream_->LastError() : ok ? S_OK : source_->ErrorResult();
+        if (!ok && SUCCEEDED(result_)) result_ = E_FAIL;
+        if (FAILED(result_)) { out.clear(); end = false; return false; }
+        return true;
+    }
+    bool Seek(std::chrono::milliseconds position) override {
+        const bool ok = source_->Seek(position);
+        result_ = (stream_ && FAILED(stream_->LastError())) ? stream_->LastError() : ok ? S_OK : source_->ErrorResult();
+        if (!ok && SUCCEEDED(result_)) result_ = E_FAIL;
+        return SUCCEEDED(result_);
+    }
+    std::optional<std::chrono::milliseconds> LastSeekPosition() const override { return source_->LastSeekPosition(); }
+    bool CanOverlapPlayback() const override { return false; }
+    int DownloadedPercent() override { return stream_ ? stream_->DownloadedPercent() : source_ ? 100 : -1; }
+    const WAVEFORMATEX& OutputFormat() const override { return source_->OutputFormat(); }
+    AudioFormat DisplayFormat() const override { return source_->DisplayFormat(); }
+    std::chrono::milliseconds Duration() const override { return source_ ? source_->Duration() : std::chrono::milliseconds{}; }
+    AudioMetadata Metadata() const override {
+        auto result=source_?source_->Metadata():AudioMetadata{};
+        const auto network=stream_?stream_->Metadata():AudioMetadata{};
+        if(!network.title.empty()) {result.title=network.title;result.artist=network.artist;}
+        result.entries.insert(result.entries.end(),network.entries.begin(),network.entries.end());
+        return result;
+    }
+    std::wstring Error() const override { return HResultMessage(L"HTTP audio", result_); }
+    HRESULT ErrorResult() const override { return result_; }
+private:
+    const plugins::PluginManager* manager_{}; HMODULE comm_{};
+    ComPtr<HttpAudioStream> stream_;
+    std::unique_ptr<DecodedAudioSource> source_;
+    HRESULT result_{E_FAIL};
+};
+
 std::unique_ptr<DecodedAudioSource> MakeBaseSource(
     const std::filesystem::path& path,
     const plugins::PluginManager* plugin_manager, HMODULE ttpcomm) {
     if (IsMidiPath(path)) return std::make_unique<MidiNonPcmSource>();
-    // CPlayList::OpenURL retains a URL as a network stream.  Extension-based
-    // AddIn creators expect SHCreateStreamOnFileEx and must never intercept
-    // values such as https://host/song.flac or http://host/song.ape.
+    // HTTP files use the recovered IStream boundary, also on XP. A reader
+    // receives bytes, never a URL passed to SHCreateStreamOnFileEx.
+    if (_wcsnicmp(path.c_str(), L"http://", 7) == 0 || _wcsnicmp(path.c_str(), L"https://", 8) == 0)
+        return std::make_unique<HttpSource>(plugin_manager, ttpcomm);
+    // Other network protocols keep their existing system providers.
     if (AudioEngine::IsNetworkMediaLocation(path))
         return std::make_unique<MediaFoundationSource>(ttpcomm);
     const auto extension = LowerExtension(path);
@@ -2162,6 +2272,8 @@ bool AudioEngine::Play(const std::filesystem::path& path, int subtrack) {
         format_ = {};
         metadata_ = {};
         open_complete_ = false;
+        opening_seek_ms_ = -1;
+        opening_paused_ = false;
         source_can_overlap_ = false;
         dsp_enabled_ = true;
         fade_pending_ = false;
@@ -2181,7 +2293,10 @@ bool AudioEngine::Play(const std::filesystem::path& path, int subtrack) {
         return false;
     }
 
-    // Decoder/reader creation is synchronous in the original play command.
+    // Network opens remain interactive while PAC, TLS or a slow non-range
+    // container is being read. Completion/error is published by the worker.
+    if (IsNetworkMediaLocation(path)) return true;
+    // Local decoder/reader creation is synchronous in the original command.
     // Waiting here also makes Duration/Format valid before PlayerWindow
     // updates the playlist row and scrolling skin text.  A private reader is
     // not, however, allowed to keep the window thread here forever.
@@ -2204,6 +2319,11 @@ void AudioEngine::RestoreAfterOutputRestart(
     {
         std::scoped_lock lock(mutex_);
         const auto current = state_.load();
+        if (current == PlaybackState::opening) {
+            opening_seek_ms_ = std::max<int64_t>(0, position.count());
+            opening_paused_ = paused;
+            return;
+        }
         if (current != PlaybackState::playing &&
             current != PlaybackState::paused) {
             return;
@@ -2211,7 +2331,9 @@ void AudioEngine::RestoreAfterOutputRestart(
 
         const int64_t target = std::clamp<int64_t>(
             position.count(), 0, duration_ms_.load());
-        QueueSeekLocked(target);
+        // A live/lengthless source cannot restore a time-to-byte position.
+        // Resume the reopened stream without sending an unsupported seek.
+        if (duration_ms_.load() > 0) QueueSeekLocked(target);
 
         if (paused) {
             // Stop the audible clock promptly. The owning worker repeats the
@@ -2284,6 +2406,7 @@ void AudioEngine::WaveOutWorker(const std::filesystem::path& path,
         std::scoped_lock lock(mutex_);
         options = options_;
     }
+    options.network_canceled = [this] { return stop_requested_.load(); };
     WaveOutSelection output = ResolveWaveOutSelection(options);
     if (!output.error.empty()) {
         if (!stop_requested_) SetError(std::move(output.error));
@@ -2499,6 +2622,10 @@ void AudioEngine::WaveOutWorker(const std::filesystem::path& path,
             if (!source->Read(native_request, native, decoder_eof)) {
                 if (!stop_requested_) SetError(source->Error(), source->ErrorResult());
                 return false;
+            }
+            if (IsNetworkMediaLocation(path)) {
+                const auto metadata=source->Metadata();
+                std::scoped_lock lock(mutex_);metadata_=metadata;
             }
             const uint64_t latest_revision = processor_revision_.load();
             if (latest_revision != direct_processor_revision) {
@@ -2922,6 +3049,10 @@ void AudioEngine::WaveOutWorker(const std::filesystem::path& path,
                 if (!source->Read(native_request, decoded, decoder_eof)) {
                     if (!stop_requested_) SetError(source->Error(), source->ErrorResult());
                     return false;
+                }
+                if (IsNetworkMediaLocation(path)) {
+                    const auto metadata=source->Metadata();
+                    std::scoped_lock lock(mutex_);metadata_=metadata;
                 }
                 if (stop_requested_) return false;
                 const uint64_t latest_revision = processor_revision_.load();
@@ -3430,6 +3561,17 @@ bool AudioEngine::PublishOpened(Backend backend, const AudioFormat& format,
             error_.clear();
             error_result_ = S_OK;
             state_ = PlaybackState::playing;
+            if (opening_seek_ms_ >= 0 && duration_ms_.load() > 0)
+                QueueSeekLocked(std::min(opening_seek_ms_, duration_ms_.load()));
+            if (opening_paused_) {
+                state_ = PlaybackState::paused;
+                if (backend == Backend::wave_out && device_)
+                    static_cast<void>(waveOutPause(device_));
+                else if (backend == Backend::direct_sound && direct_sound_buffer_)
+                    static_cast<void>(direct_sound_buffer_->Stop());
+            }
+            opening_seek_ms_ = -1;
+            opening_paused_ = false;
             track_gain_ = 1.0F;
             if (backend != Backend::midi &&
                 (options_.sound_fade_mode & 0x01) != 0 &&
@@ -3447,6 +3589,8 @@ bool AudioEngine::PublishOpened(Backend backend, const AudioFormat& format,
                 ApplyVolumeLocked();
             }
             published = true;
+            if (state_notification_window_ && state_notification_message_)
+                PostMessageW(state_notification_window_, state_notification_message_, 0, 0);
         }
         open_complete_ = true;
     }
@@ -3551,6 +3695,9 @@ void AudioEngine::SeekWithoutFade(std::chrono::milliseconds position) {
 void AudioEngine::QueueSeekLocked(int64_t position_ms) {
     const auto state = state_.load();
     if (state != PlaybackState::playing && state != PlaybackState::paused) return;
+    // 004E5EB2's live/lengthless stream has no time seek contract. A UI seek
+    // must not turn duration 0 into a request to restart and fail the stream.
+    if (duration_ms_.load() <= 0) return;
     ++seek_revision_;
     pending_seek_position_ms_ = position_ms;
     seek_request_ms_ = position_ms;
@@ -3580,6 +3727,13 @@ void AudioEngine::CancelSeekLocked() {
 
 void AudioEngine::SeekImpl(std::chrono::milliseconds position,
                            bool allow_fade) {
+    {
+        std::scoped_lock lock(mutex_);
+        if (state_.load() == PlaybackState::opening) {
+            opening_seek_ms_ = std::max<int64_t>(0, position.count());
+            return;
+        }
+    }
     const auto state = state_.load();
     if (state != PlaybackState::playing && state != PlaybackState::paused) return;
     ClearVisualization();

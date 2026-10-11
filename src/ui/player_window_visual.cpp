@@ -1452,6 +1452,19 @@ LRESULT CALLBACK PlayerWindow::VisualWindowProc(HWND window, UINT message,
 LRESULT PlayerWindow::HandleVisualMessage(
     UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
+    case WM_NCHITTEST:
+        if (skin_ && !external_skin_ && !fullscreen_visual_detached_) {
+            POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            ScreenToClient(window_, &point);
+            const auto playback = audio_->State();
+            const skin::SkinLayers layers(PlayerSkinLayers(ActiveSkinElements(),
+                playback == audio::PlaybackState::playing || playback == audio::PlaybackState::opening,
+                settings_.player.play_mode, CurrentLedText(), CurrentSkinIcon(), MainSkinButtonBounds(L"play")),
+                skin_->TransparentColor());
+            if (const auto* hit = layers.Hit(point); hit && hit->element->name != L"visual")
+                return HTTRANSPARENT;
+        }
+        return HTCLIENT;
     case WM_ERASEBKGND:
         return 1;
     case WM_PRINTCLIENT:
@@ -1654,15 +1667,11 @@ void PlayerWindow::UpdateVisualWindowLayout() {
     SetWindowPos(visual_window_, nullptr, analysis_bounds.left,
                  analysis_bounds.top, width, height,
                  SWP_NOACTIVATE | SWP_NOZORDER | (plugin_embedded?SWP_HIDEWINDOW:SWP_SHOWWINDOW));
-    if (skin_ && element && !plugin_embedded) {
-        const auto playback = audio_->State();
-        const skin::SkinLayers layers(PlayerSkinLayers(ActiveSkinElements(),
-            playback == audio::PlaybackState::playing || playback == audio::PlaybackState::opening,
-            settings_.player.play_mode, CurrentLedText()), skin_->TransparentColor());
-        const HRGN region = layers.Region(element);
-        OffsetRgn(region, -analysis_bounds.left, -analysis_bounds.top);
-        if (!SetWindowRgn(visual_window_, region, TRUE)) DeleteObject(region);
-    } else SetWindowRgn(visual_window_, nullptr, TRUE);
+    // 00467B9B creates VisualCtrl without WS_CLIPSIBLINGS. Its worker's
+    // GetDC frame may overpaint earlier siblings, even though those siblings
+    // remain the mouse targets. Keep the full paint rectangle and resolve
+    // overlapping input separately in WM_NCHITTEST.
+    SetWindowRgn(visual_window_, nullptr, TRUE);
     const auto background = ActiveSkinBackground();
     visual_runtime_->Configure(settings_.visual, {width, height}, false,
                                plugin_embedded?skin::SkinImage{}:background, &analysis_bounds);

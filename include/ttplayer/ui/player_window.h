@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ttplayer/audio/audio_engine.h"
+#include "ttplayer/audio/http_download_queue.h"
 #include "ttplayer/audio/extension_correction.h"
 #include "ttplayer/integrations/discord_presence.h"
 #include "ttplayer/lyrics/lrc_parser.h"
@@ -12,6 +13,8 @@
 #include "ttplayer/plugins/plugin_manager.h"
 #include "ttplayer/settings/settings.h"
 #include "ttplayer/skin/skin.h"
+#include "ttplayer/skin/skin_button.h"
+#include "ttplayer/skin/skin_slider.h"
 #include "ttplayer/skin/skin_package.h"
 #include "ttplayer/skin/skin_plugin.h"
 #include "ttplayer/ui/desktop_lyrics.h"
@@ -229,7 +232,22 @@ private:
     void CreateControls();
     void LayoutControls(int width, int height) const;
     void Paint(HDC dc) const;
-    void PaintSkin(HDC dc) const;
+    void PaintSkin(HDC dc, const std::vector<std::wstring>* repaint = nullptr) const;
+    void InvalidateSkinElement(std::wstring_view name);
+    skin::SkinButtonState& MainSkinButton(std::wstring_view name) const;
+    bool MainSkinButtonContains(std::wstring_view name, POINT point) const;
+    RECT MainSkinButtonBounds(std::wstring_view name) const;
+    RECT SkinSliderThumbRegion(const skin::SkinElement& element) const;
+    skin::SkinSliderGeometry MainSliderGeometry(const skin::SkinElement& element) const;
+    bool HandleMainSkinSliderMessage(UINT message, WPARAM wparam, LPARAM lparam);
+    void ApplyMainSkinSliderEvent(const std::wstring& name, const skin::SkinSliderEvent& event);
+    std::optional<skin::SkinSliderGeometry> EqualizerSliderGeometry(int slider) const;
+    bool HandleEqualizerSliderMessage(UINT message, WPARAM wparam, LPARAM lparam);
+    skin::SkinButtonState& NativeSkinButton(HWND control, bool checked = false) const {
+        auto& state = native_skin_buttons_[control];
+        state.Sync(IsWindowEnabled(control) != FALSE, checked);
+        return state;
+    }
     void DrawSkinElement(HDC dc, const skin::SkinElement& element, int state) const;
     void DrawAnimatedSkinFrame(HDC dc, const skin::SkinElement& element,
                                RECT bounds, int state, HWND owner) const;
@@ -256,6 +274,7 @@ private:
     [[nodiscard]] std::wstring CurrentLedText() const;
     [[nodiscard]] skin::SkinImage ActiveSkinBackground() const noexcept;
     [[nodiscard]] SIZE ActiveSkinSize() const noexcept;
+    [[nodiscard]] HICON CurrentSkinIcon() const noexcept;
     [[nodiscard]] const std::vector<skin::SkinElement>& ActiveSkinElements() const noexcept;
     [[nodiscard]] const skin::SkinElement* FindActiveSkinElement(std::wstring_view name) const;
     [[nodiscard]] std::wstring HitTestSkin(POINT point) const;
@@ -781,8 +800,20 @@ private:
     void RebuildSkinInfoItems(bool include_track_details);
     void ResetSkinInfoScroll();
     void AdvanceSkinInfoScroll(UINT_PTR timer);
+    void PaintSkinInfoTick();
+    std::wstring_view ActiveMainSkinButton(std::wstring_view name) const;
     void StartSkinInfoItem();
     bool PlayCurrent();
+    bool CompletePlaybackOpen(const playlist::Track& track);
+    void PollNetworkPlayback();
+    void PollNetworkDownloads();
+    void ConfigureNetworkDownloads();
+    void QueueNetworkDownload(const playlist::Track& track);
+    void ShowNetworkDownloads();
+    std::unique_ptr<audio::HttpDownloadQueue> network_downloads_;
+    std::wstring network_auto_download_url_;
+    ULONGLONG network_prefetch_after_{};
+    bool network_download_dialog_open_{};
     void ClearPersistedPlaybackIdentity() noexcept;
     void SelectTrack(size_t index, bool start_playback);
     void SelectTrackFrom(size_t playlist_index, size_t index, bool start_playback);
@@ -1044,8 +1075,22 @@ private:
     int info_scroll_direction_{};
     int info_scroll_hold_ticks_{};
     int info_vertical_offset_{};
+    UINT_PTR info_timer_{};
+    mutable const skin::SkinElement* play_button_layout_{};
+    mutable std::wstring play_button_image_;
+    mutable RECT play_button_bounds_{};
     std::wstring hover_skin_element_;
+    std::optional<std::wstring> last_skin_mouse_down_target_;
+    std::wstring captured_skin_button_;
+    mutable std::unordered_map<std::wstring, skin::SkinButtonState> main_skin_buttons_;
+    mutable std::unordered_map<HWND, skin::SkinButtonState> native_skin_buttons_;
+    std::vector<std::wstring> dirty_skin_elements_;
+    std::unordered_map<std::wstring, std::wstring> skin_display_values_;
+    mutable std::unordered_map<std::wstring, RECT> skin_slider_thumbs_;
     std::wstring pressed_skin_element_;
+    std::unordered_map<std::wstring, skin::SkinSliderState> main_skin_sliders_;
+    std::wstring captured_skin_slider_;
+    std::wstring focused_skin_slider_;
     std::optional<std::chrono::milliseconds> progress_tracking_position_;
     bool dragging_skin_background_{};
     HWND skin_drag_window_{};
@@ -1062,6 +1107,7 @@ private:
     bool have_mini_window_bounds_{};
     bool playback_was_active_{};
     bool playback_source_open_{};
+    bool network_open_pending_{};
     bool natural_completion_dispatch_{};
     bool pending_natural_play_{};
     std::optional<playlist::Track> pending_wave_track_change_;
@@ -1119,6 +1165,7 @@ private:
     int equalizer_focused_slider_{};
     int equalizer_slider_drag_offset_{};
     int equalizer_slider_initial_value_{};
+    std::unordered_map<int, skin::SkinSliderState> equalizer_slider_states_;
     int lyric_hover_command_{};
     int lyric_pressed_command_{};
     bool desktop_lyric_mode_{};

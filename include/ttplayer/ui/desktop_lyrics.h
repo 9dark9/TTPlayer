@@ -37,7 +37,7 @@ public:
                 PopupMenuTracker popup_tracker = {});
     void Destroy() noexcept;
 
-    void SetSkin(const skin::LegacySkin* skin);
+    void SetSkin(const skin::LegacySkin* skin, HICON default_icon = nullptr);
     void SetLyrics(const lyrics::Lyrics* lyrics);
     void SetFallbackText(std::wstring text);
     void UpdatePlayback(std::chrono::milliseconds position, bool playing);

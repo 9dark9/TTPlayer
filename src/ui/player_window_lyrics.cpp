@@ -414,6 +414,20 @@ LRESULT PlayerWindow::HandleLyricControlMessage(HWND control, UINT message,
     const int identifier = GetDlgCtrlID(control);
     const bool text_control = content_surface || control == lyric_control_ ||
         identifier == kLyricControlId;
+    if (!text_control) {
+        if (message == WM_NCDESTROY) native_skin_buttons_.erase(control);
+        else {
+            const auto previous = native_skin_buttons_[control];
+            auto& button = NativeSkinButton(control,
+                identifier == static_cast<int>(kCmdLyricTopMost) && ActiveLyricTopMost());
+            bool invoke{};
+            if (skin::HandleSkinButtonInput(control, button, message, wparam, lparam, invoke)) {
+                if (previous != button) InvalidateRect(control, nullptr, TRUE);
+                if (invoke) HandleLyricCommand(static_cast<UINT>(identifier));
+                return 0;
+            }
+        }
+    }
     switch (message) {
     case WM_WINDOWPOSCHANGED:
     case WM_STYLECHANGED:
@@ -1047,9 +1061,10 @@ void PlayerWindow::ApplyActiveLyricWindowState(bool apply_visibility) {
         int height = layout.background.size.cy;
         const bool resizable = layout.resize_rect.right > layout.resize_rect.left &&
                                layout.resize_rect.bottom > layout.resize_rect.top;
-        if (resizable && have_target) {
-            width = std::max<LONG>(width, target.right - target.left);
-            height = std::max<LONG>(height, target.bottom - target.top);
+        if (resizable) {
+            const RECT bounds = have_target ? target : layout.position;
+            width = std::max<LONG>(width, bounds.right - bounds.left);
+            height = std::max<LONG>(height, bounds.bottom - bounds.top);
         }
         target = {left, top, left + width, top + height};
     }
@@ -1072,7 +1087,7 @@ void PlayerWindow::ApplyActiveLyricWindowState(bool apply_visibility) {
 
 bool PlayerWindow::CreateLyricWindow() {
     if (lyric_window_) return true;
-    if (!skin_ || !skin_->Lyric().valid) return false;
+    if (!skin_) return false;
     const auto& layout = skin_->Lyric();
     RECT player{};
     GetWindowRect(window_, &player);
@@ -1097,7 +1112,16 @@ bool PlayerWindow::CreateLyricWindow() {
         height = skin_->MiniWindowSize().cy;
         x = player.right;
         y = player.top;
+    } else if (!IsRectEmpty(&layout.resize_rect)) {
+        // 00449451 uses the skin's initial rectangle for a resizable lyric
+        // window. Its bitmap is the minimum size, not the initial size.
+        width = std::max<LONG>(width, layout.position.right - layout.position.left);
+        height = std::max<LONG>(height, layout.position.bottom - layout.position.top);
     }
+    // The retained lyric manager HWND also owns the independent desktop
+    // surfaces (004186BC). Missing window artwork must not prevent creation
+    // of that owner. Keep it hidden until a valid window skin is installed.
+    if (!layout.valid) { width = std::max(1, width); height = std::max(1, height); }
     if (width <= 0 || height <= 0) return false;
 
     const DWORD extended = WS_EX_TOOLWINDOW |
@@ -1145,7 +1169,7 @@ bool PlayerWindow::CreateDesktopLyrics() {
             std::move(track_popup))) {
         return false;
     }
-    desktop_lyrics_.SetSkin(skin_ ? &*skin_ : nullptr);
+    desktop_lyrics_.SetSkin(skin_ ? &*skin_ : nullptr, window_icon_small_);
     desktop_lyrics_.SetLyrics(&lyrics_);
     desktop_lyrics_.UpdatePlayback(
         audio_->Position(), audio_->State() == audio::PlaybackState::playing);
@@ -1473,7 +1497,7 @@ void PlayerWindow::UpdateLyricWindowSkin(bool saved_bounds) {
             ShowWindow(lyric_window_, SW_HIDE);
         }
         if (window_) InvalidateRect(window_, nullptr, FALSE);
-        desktop_lyrics_.SetSkin(skin_ ? &*skin_ : nullptr);
+        desktop_lyrics_.SetSkin(skin_ ? &*skin_ : nullptr, window_icon_small_);
         return;
     }
     if (!lyric_window_ && !CreateLyricWindow()) return;
@@ -1484,7 +1508,7 @@ void PlayerWindow::UpdateLyricWindowSkin(bool saved_bounds) {
         ApplyActiveLyricWindowState();
         if (desktop_lyric_mode_) {
             ShowWindow(lyric_window_, SW_HIDE);
-            desktop_lyrics_.SetSkin(&*skin_);
+            desktop_lyrics_.SetSkin(&*skin_, window_icon_small_);
             desktop_lyrics_.ApplySettings();
             desktop_lyrics_.Show(desktop_was_visible);
         }
@@ -1518,7 +1542,7 @@ void PlayerWindow::UpdateLyricWindowSkin(bool saved_bounds) {
         RDW_UPDATENOW);
     if (ActiveLyricVisible())
         ShowWindow(lyric_window_, SW_SHOWNOACTIVATE);
-    desktop_lyrics_.SetSkin(&*skin_);
+    desktop_lyrics_.SetSkin(&*skin_, window_icon_small_);
     desktop_lyrics_.ApplySettings();
     if (desktop_lyric_mode_) {
         ShowWindow(lyric_window_, SW_HIDE);
@@ -1780,12 +1804,8 @@ void PlayerWindow::PaintLyricControl(HWND control, HDC dc, bool present_layered,
         else if (command == static_cast<int>(kCmdLyricTopMost)) element = &layout.ontop;
         else if (command == static_cast<int>(kCmdDesktopLyrics)) element = &layout.desklrc;
         if (element) {
-            int state = lyric_pressed_command_ == command &&
-                        lyric_hover_command_ == command &&
-                        GetCapture() == control
-                ? 2 : lyric_hover_command_ == command ? 1 : 0;
-            if (command == static_cast<int>(kCmdLyricTopMost) &&
-                ActiveLyricTopMost()) state = 2;
+            const int state = NativeSkinButton(control,
+                command == static_cast<int>(kCmdLyricTopMost) && ActiveLyricTopMost()).Frame();
             const RECT local{0, 0, width, height};
             DrawAnimatedSkinFrame(canvas, *element, local, state, control);
         }
@@ -4224,6 +4244,15 @@ bool PlayerWindow::HandleLyricCommand(UINT command) {
         return true;
     case kCmdLyricTopMost:
         ActiveLyricTopMost() = !ActiveLyricTopMost();
+        // 0044D3DC always reorders this HWND with flags 0x13. Even when its
+        // owner is topmost and User32 retains the effective TOPMOST bit,
+        // unpinning moves it behind other owned windows. The group helper's
+        // "unchanged effective band" shortcut would suppress that transition.
+        if (lyric_window_)
+            SetWindowPos(lyric_window_, ActiveLyricTopMost() ? HWND_TOPMOST : HWND_NOTOPMOST,
+                0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        // 0045A04E reasserts the main owner's pin on the next idle update.
+        // Reconcile after the native reorder, preserving its resulting order.
         ApplySkinWindowTopMost();
         if (lyric_ontop_) InvalidateRect(lyric_ontop_, nullptr, FALSE);
         return true;

@@ -18,7 +18,7 @@ from check_legacy_imports import exports, inspect
 REPOSITORY = 'https://github.com/TTPlayerRebuild/TTPlayerHttps'
 API = 'https://api.github.com/repos/TTPlayerRebuild/TTPlayerHttps/releases/latest'
 LIMIT = 16 * 1024 * 1024
-REQUIRED_ABI = 6
+REQUIRED_ABI = 7
 
 
 def capabilities(data):
@@ -51,7 +51,7 @@ def capabilities(data):
 
     rva, size = read('II', optional+112)
     if not rva or size < 16:
-        raise ValueError('HTTPS component has no capability resource; ABI 6 is required')
+        raise ValueError('HTTPS component has no capability resource; ABI 7 is required')
 
     def relative(at, length):
         if at < 0 or at+length > size:
@@ -67,7 +67,7 @@ def capabilities(data):
                 if bool(target & 0x80000000) != directory:
                     raise ValueError('Invalid HTTPS resource tree')
                 return target & 0x7fffffff
-        raise ValueError('HTTPS component lacks ABI 6 capability metadata')
+        raise ValueError('HTTPS component lacks ABI 7 capability metadata')
 
     # RT_RCDATA / ID 100 / LANG_NEUTRAL, fixed 16-byte versioned record.
     entry = child(child(child(0, 10, True), 100, True), 0, False)
@@ -75,8 +75,8 @@ def capabilities(data):
     if length != 16:
         raise ValueError('Unexpected HTTPS capability record size')
     magic, version, abi, features = read('IIII', mapped(payload, length))
-    if magic != 0x48505454 or version != 1 or abi < REQUIRED_ABI or features & 0x1f != 0x1f:
-        raise ValueError('HTTPS component does not provide required ABI 6 lyric capabilities')
+    if magic != 0x48505454 or version != 1 or abi < REQUIRED_ABI or features & 0x3f != 0x3f:
+        raise ValueError('HTTPS component does not provide required ABI 7 media/lyric capabilities')
     return {'max_abi': abi, 'features': features}
 
 

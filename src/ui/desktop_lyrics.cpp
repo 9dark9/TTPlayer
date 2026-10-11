@@ -1,4 +1,5 @@
 #include "ttplayer/skin/skin_layers.h"
+#include "ttplayer/skin/skin_button.h"
 #include "ttplayer/i18n/i18n.h"
 #include "ttplayer/ui/wtl_menu.h"
 #include "ttplayer/ui/desktop_lyrics.h"
@@ -252,6 +253,7 @@ public:
     struct Button final {
         UINT command{};
         HWND window{};
+        mutable skin::SkinButtonState state;
     };
 
     struct GlyphMask final {
@@ -340,8 +342,6 @@ public:
         hover_primed_ = false;
         menu_tracking_ = false;
         control_alpha_valid_ = false;
-        hover_button_ = 0;
-        pressed_button_ = 0;
         if (control_ && IsWindow(control_)) {
             KillTimer(control_, kRenderTimer);
             KillTimer(control_, kHoverTimer);
@@ -368,8 +368,13 @@ public:
         masks_.clear();
     }
 
-    void SetSkin(const skin::LegacySkin* value) {
+    void SetSkin(const skin::LegacySkin* value, HICON default_icon) {
+        for (auto& button : buttons_) {
+            if (button.window && GetCapture() == button.window) ReleaseCapture();
+            button.state = {};
+        }
         skin_ = value;
+        default_icon_ = default_icon;
         ApplyBarSkin();
     }
 
@@ -505,27 +510,6 @@ private:
             InvalidateRect(bar_, nullptr, FALSE);
     }
 
-    void SetButtonInteraction(UINT hover, UINT pressed) noexcept {
-        // 0040A5E3 returns without invalidating when the visual state is
-        // unchanged. Mouse movement within one button is not a new frame.
-        if (hover_button_ == hover && pressed_button_ == pressed) return;
-        const std::array<UINT,4> changed{hover_button_, hover, pressed_button_, pressed};
-        hover_button_ = hover;
-        pressed_button_ = pressed;
-        // Native SkinButton invalidates its own HWND. The rebuilt toolbar
-        // composites PNG children centrally, so restrict the parent's update
-        // region to the affected children instead of erasing the entire bar.
-        for (const UINT command : changed) {
-            if (!command || !bar_ || !IsWindow(bar_)) continue;
-            const HWND child = GetDlgItem(bar_, static_cast<int>(command));
-            RECT bounds{};
-            if (child && GetWindowRect(child, &bounds)) {
-                MapWindowPoints(nullptr, bar_, reinterpret_cast<POINT*>(&bounds), 2);
-                InvalidateRect(bar_, &bounds, FALSE);
-            }
-        }
-    }
-
     [[nodiscard]] BYTE ConfiguredControlAlpha() const noexcept {
         return settings_
             ? static_cast<BYTE>(std::max(1, settings_->background_alpha))
@@ -557,8 +541,6 @@ private:
     void SetBarVisible(bool show) noexcept {
         if (!bar_ || !IsWindow(bar_)) return;
         if (!show) {
-            hover_button_ = 0;
-            pressed_button_ = 0;
         }
         if ((IsWindowVisible(bar_) != FALSE) == show) return;
         SetWindowPos(bar_, nullptr, 0, 0, 0, 0,
@@ -675,8 +657,6 @@ private:
                 self->icon_ = nullptr;
                 for (auto& button : self->buttons_)
                     button.window = nullptr;
-                self->hover_button_ = 0;
-                self->pressed_button_ = 0;
             }
             SetWindowLongPtrW(window, GWLP_USERDATA, 0);
         }
@@ -688,6 +668,23 @@ private:
         auto* self = reinterpret_cast<Impl*>(reference);
         if (!self) return DefSubclassProc(window, message, wparam, lparam);
         const UINT command = static_cast<UINT>(GetDlgCtrlID(window));
+        for (auto& button : self->buttons_) if (button.window == window) {
+            const auto previous = button.state;
+            button.state.Sync(IsWindowEnabled(window) != FALSE, self->ButtonChecked(command));
+            bool invoke{};
+            if (skin::HandleSkinButtonInput(window, button.state, message, wparam, lparam, invoke)) {
+                if (previous != button.state) {
+                    RECT bounds{};
+                    GetWindowRect(window, &bounds);
+                    MapWindowPoints(nullptr, self->bar_, reinterpret_cast<POINT*>(&bounds), 2);
+                    InvalidateRect(self->bar_, &bounds, FALSE);
+                }
+                if (invoke) self->HandleCommand(command);
+                return 0;
+            }
+            if (message == WM_NCDESTROY) button.state = {};
+            break;
+        }
         if (self->tooltip_ && message >= WM_MOUSEFIRST &&
             message <= WM_MOUSELAST) {
             MSG relay{};
@@ -717,57 +714,9 @@ private:
             EndPaint(window, &paint);
             return 0;
         }
-        case WM_MOUSEMOVE: {
-            RECT client{};
-            GetClientRect(window, &client);
-            const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-            const bool inside = IsWindowEnabled(window) && PtInRect(&client, point);
-            if (inside && self->hover_button_ != command) {
-                TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
-                TrackMouseEvent(&tracking);
-            }
-            const UINT hover = inside ? command
-                : self->hover_button_ == command ? 0 : self->hover_button_;
-            self->SetButtonInteraction(hover, self->pressed_button_);
-            return 0;
-        }
-        case WM_MOUSELEAVE:
-            if (self->hover_button_ == command)
-                self->SetButtonInteraction(0, self->pressed_button_);
-            return 0;
-        case WM_LBUTTONDOWN:
-            if (!IsWindowEnabled(window)) return 0;
-            SetFocus(window);
-            SetCapture(window);
-            self->SetButtonInteraction(command, command);
-            return 0;
-        case WM_LBUTTONUP: {
-            POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-            RECT client{};
-            GetClientRect(window, &client);
-            const bool invoke = self->pressed_button_ == command &&
-                                PtInRect(&client, point) != FALSE;
-            const UINT hover = PtInRect(&client, point) ? command
-                : self->hover_button_ == command ? 0 : self->hover_button_;
-            // Publish the release once, before synchronous CAPTURECHANGED.
-            self->SetButtonInteraction(hover, 0);
-            if (GetCapture() == window) ReleaseCapture();
-            if (invoke) self->HandleCommand(command);
-            return 0;
-        }
-        case WM_CAPTURECHANGED:
-        case WM_CANCELMODE:
-            if (self->pressed_button_ == command)
-                self->SetButtonInteraction(self->hover_button_, 0);
-            if (message == WM_CANCELMODE && GetCapture() == window) ReleaseCapture();
-            return 0;
-        case WM_ENABLE:
-            if (!wparam) {
-                self->SetButtonInteraction(self->hover_button_ == command ? 0 : self->hover_button_,
-                    self->pressed_button_ == command ? 0 : self->pressed_button_);
-                if (GetCapture() == window) ReleaseCapture();
-            }
-            self->InvalidateBar();
+        case WM_LBUTTONUP:
+            // SkinIcon has its own release command and no four-state bitmap.
+            if (command == kCommandIcon) self->HandleCommand(command);
             return 0;
         case WM_CONTEXTMENU: {
             POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
@@ -785,8 +734,6 @@ private:
             for (auto& button : self->buttons_) {
                 if (button.window == window) button.window = nullptr;
             }
-            if (self->hover_button_ == command) self->hover_button_ = 0;
-            if (self->pressed_button_ == command) self->pressed_button_ = 0;
             RemoveWindowSubclass(window, ButtonSubclassProc, 1);
             break;
         default: break;
@@ -1126,15 +1073,17 @@ private:
         SetLayeredWindowAttributes(bar_, transparent, 255,
                                    LWA_COLORKEY | LWA_ALPHA);
 
-        RECT icon_bounds{5, 4, 21, 20};
-        if (layout && ValidRect(layout->icon)) icon_bounds = layout->icon;
+        // 004186BC applies even the empty XML icon rectangle. A custom bar
+        // without <icon> must not retain the default icon's invisible hit
+        // target over its first button.
+        RECT icon_bounds = layout && layout->valid ? layout->icon : RECT{5, 4, 21, 20};
         if (icon_) MoveWindow(icon_, icon_bounds.left, icon_bounds.top,
             Width(icon_bounds), Height(icon_bounds), FALSE);
         for (auto& button : buttons_) {
             RECT bounds = DefaultBarRect(button.command);
             const auto* element = ButtonElement(button.command);
             const bool present = layout && layout->valid
-                ? element && element->image && ValidRect(element->bounds)
+                ? element && ValidRect(element->bounds)
                 : ValidRect(bounds);
             if (element && ValidRect(element->bounds)) bounds = element->bounds;
             if (!button.window) continue;
@@ -1145,7 +1094,8 @@ private:
             if (present) MoveWindow(button.window, bounds.left, bounds.top,
                 Width(bounds), Height(bounds), FALSE);
             if (present && element && element->image) {
-                const HRGN region = element->image.CreateRegion(transparent, 4);
+                const HRGN region = element->image.IsGdiPlus() || element->image.ButtonColorKey(transparent) != CLR_INVALID
+                    ? element->image.CreateRegion(transparent, 4) : nullptr;
                 if (!SetWindowRgn(button.window, region, FALSE) && region) DeleteObject(region);
             } else SetWindowRgn(button.window, nullptr, FALSE);
             if (tooltip_) {
@@ -1227,18 +1177,21 @@ private:
             RECT bounds{};
             GetWindowRect(icon_, &bounds);
             MapWindowPoints(nullptr, bar_, reinterpret_cast<POINT*>(&bounds), 2);
-            HICON icon = skin_ ? skin_->Icon() : nullptr;
-            if (!icon && command_target_) {
-                icon = reinterpret_cast<HICON>(SendMessageW(
-                    command_target_, WM_GETICON, ICON_SMALL, 0));
-            }
-            if (icon) DrawIconEx(dc, bounds.left, bounds.top, icon,
-                Width(bounds), Height(bounds), 0, nullptr, DI_NORMAL);
+            HICON icon = layout ? layout->icon_image.Get() : nullptr;
+            if (!icon) icon = default_icon_;
+            if (icon) skin::DrawNativeSkinIcon(dc, icon, bounds);
         }
         for (const auto& button : buttons_) {
             const skin::SkinLayerClip clip(dc, layers, ButtonElement(button.command));
             DrawBarButton(dc, button);
         }
+    }
+
+    bool ButtonChecked(UINT command) const {
+        return settings_ && ((command == kCommandKaraoke && settings_->karaoke_mode) ||
+            (command == kCommandLines && settings_->lines == 2) ||
+            (command == kCommandLock && settings_->lock) ||
+            (command == kCommandTopmost && settings_->topmost));
     }
 
     void DrawBarButton(HDC dc, const Button& button) const {
@@ -1248,18 +1201,8 @@ private:
         RECT bounds{};
         GetWindowRect(button.window, &bounds);
         MapWindowPoints(nullptr, bar_, reinterpret_cast<POINT*>(&bounds), 2);
-        int frame = 0;
-        const bool checked =
-            (button.command == kCommandKaraoke && settings_ &&
-             settings_->karaoke_mode) ||
-            (button.command == kCommandLines && settings_ &&
-             settings_->lines == 2) ||
-            (button.command == kCommandLock && settings_ && settings_->lock) ||
-            (button.command == kCommandTopmost && settings_ && settings_->topmost);
-        if (!IsWindowEnabled(button.window)) frame = 3;
-        else if (pressed_button_ == button.command && hover_button_ == button.command) frame = 2;
-        else if (hover_button_ == button.command) frame = 1;
-        else if (checked) frame = 2;
+        button.state.Sync(IsWindowEnabled(button.window) != FALSE, ButtonChecked(button.command));
+        const int frame = button.state.Frame();
         const int frame_width = element->frames > 1
             ? element->image_size.cx / element->frames
             : element->image_size.cx;
@@ -1267,8 +1210,10 @@ private:
         // The PNG's HBITMAP is only a compatibility view; SRCCOPY of that
         // view discards alpha and paints black behind transparent sprites.
         // Draw preserves GDI+ source-over for PNG and old SRCCOPY for BMP.
-        element->image.Draw(dc, bounds.left, bounds.top, Width(bounds), Height(bounds),
-            frame_width * frame, 0, frame_width, element->image_size.cy);
+        const COLORREF key = skin_ ? skin_->DesktopLyricBar().transparent_color : CLR_INVALID;
+        element->image.Draw(dc, bounds.left, bounds.top, frame_width, element->image_size.cy,
+            frame_width * frame, 0, frame_width, element->image_size.cy,
+            element->image.ButtonColorKey(key));
     }
 
     void HandleCommand(UINT command) {
@@ -2148,6 +2093,7 @@ private:
     RECT* persisted_bounds_{};
     PopupMenuTracker popup_tracker_;
     const skin::LegacySkin* skin_{};
+    HICON default_icon_{}; // Borrowed application fallback, never the main skin icon.
     const lyrics::Lyrics* lyrics_{};
     HWND control_{};
     HWND paint_{};
@@ -2176,8 +2122,6 @@ private:
     bool hover_primed_{};
     bool menu_tracking_{};
     bool render_request_pending_{};
-    UINT hover_button_{};
-    UINT pressed_button_{};
     bool mask_cache_dirty_{true};
     size_t rendered_line_{std::numeric_limits<size_t>::max()};
     int mask_width_{};
@@ -2198,8 +2142,8 @@ bool DesktopLyricsWindow::Create(HINSTANCE instance, HWND lyric_owner,
 }
 
 void DesktopLyricsWindow::Destroy() noexcept { impl_->Destroy(); }
-void DesktopLyricsWindow::SetSkin(const skin::LegacySkin* skin) {
-    impl_->SetSkin(skin);
+void DesktopLyricsWindow::SetSkin(const skin::LegacySkin* skin, HICON default_icon) {
+    impl_->SetSkin(skin, default_icon);
 }
 void DesktopLyricsWindow::SetLyrics(const lyrics::Lyrics* lyrics) {
     impl_->SetLyrics(lyrics);

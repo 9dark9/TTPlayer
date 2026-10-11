@@ -4,6 +4,7 @@
 #include "ttplayer/skin/default_colors.h"
 
 #include <filesystem>
+#include <functional>
 #include <array>
 #include <optional>
 #include <span>
@@ -15,6 +16,7 @@
 namespace ttplayer::settings { struct Settings; }
 
 namespace ttplayer::skin {
+class SkinPackage;
 // The first 0x24 bytes of TTPlayer's private skin-package object are the
 // package identity and the metadata parsed from the root <skin> element by
 // CSkinParser_ParseMetadata (004A8315).  Keep these fields independent from
@@ -72,7 +74,7 @@ struct SkinElement {
     COLORREF color{RGB(255, 255, 255)};
     COLORREF background{0xff000000};
     unsigned int alignment{};
-    std::wstring font; // empty: use the parser caption-font seed
+    std::wstring font; // empty: no custom HFONT (004AA061)
     int font_size{12};
 };
 
@@ -86,6 +88,7 @@ struct SkinBitmap {
 // independent backgrounds, native sizes and control coordinates.
 struct PlayerSkinLayout {
     SkinImage background{};
+    SkinIcons icons;
     SIZE window_size{};
     std::vector<SkinElement> elements;
 };
@@ -116,6 +119,9 @@ struct PlaylistSkin {
     SkinBitmap scrollbar_buttons;
     SkinBitmap scrollbar_thumb;
     SkinBitmap scrollbar_bar;
+    [[nodiscard]] bool HasSkinnedScrollbar() const noexcept {
+        return scrollbar_buttons.image && scrollbar_thumb.image && scrollbar_bar.image;
+    }
     // XML thumb_resize_center is the height of the stretch/tile source
     // segment, not a boolean (00488463 reads it as an integer at +0xEB4).
     int scrollbar_thumb_resize_center{};
@@ -189,8 +195,9 @@ struct LyricSkin {
 struct DesktopLyricBarSkin {
     bool valid{};
     SkinBitmap background;
-    COLORREF transparent_color{RGB(255, 0, 255)};
+    COLORREF transparent_color{CLR_INVALID};
     RECT icon{};
+    SkinIcon icon_image;
     SkinElement play;
     SkinElement pause;
     SkinElement previous;
@@ -228,8 +235,13 @@ struct VisualSkin {
 
 class LegacySkin {
 public:
+    using AssetLoader = std::function<bool(const std::filesystem::path&)>;
     static LegacySkin Load(const std::filesystem::path& directory,
-                           const settings::Settings* current = nullptr);
+                           const settings::Settings* current = nullptr,
+                           AssetLoader assets = {});
+    static LegacySkin LoadPackage(const SkinPackage& package,
+        const std::filesystem::path& directory, HMODULE ttpcomm,
+        const settings::Settings* current = nullptr);
     LegacySkin() = default;
     ~LegacySkin();
     LegacySkin(const LegacySkin&) = delete;
@@ -239,7 +251,10 @@ public:
 
     [[nodiscard]] bool Valid() const noexcept { return background_ != nullptr; }
     [[nodiscard]] const SkinImage& Background() const noexcept { return background_; }
-    [[nodiscard]] HICON Icon() const noexcept { return icon_; }
+    [[nodiscard]] HICON Icon(bool mini = false, bool large = false) const noexcept {
+        const auto& icons = mini ? mini_.icons : icons_;
+        return (large ? icons.large_icon : icons.small_icon).Get();
+    }
     [[nodiscard]] SIZE WindowSize() const noexcept { return window_size_; }
     [[nodiscard]] COLORREF TransparentColor() const noexcept { return transparent_color_; }
     [[nodiscard]] const std::vector<SkinElement>& Elements() const noexcept { return elements_; }
@@ -273,14 +288,16 @@ public:
     [[nodiscard]] HRGN CreateWindowRegion(bool mini = false) const;
 
     // Cache and layouts share image ownership, including across rebinds.
-    SkinImage LoadBitmap(const std::filesystem::path& path);
+    SkinImage LoadBitmap(const std::filesystem::path& path, bool* replacement_started = nullptr);
+    bool PrepareAsset(const std::filesystem::path& path) const;
 
 private:
     std::unordered_map<std::wstring, SkinImage> bitmaps_;
     SkinImage background_{};
-    HICON icon_{};
+    SkinIcons icons_;
+    AssetLoader assets_; // used only during Load; never retains the package
     SIZE window_size_{};
-    COLORREF transparent_color_{RGB(255, 0, 255)};
+    COLORREF transparent_color_{CLR_INVALID};
     std::vector<SkinElement> elements_;
     PlayerSkinLayout mini_;
     LyricSkin lyric_;

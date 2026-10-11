@@ -2873,8 +2873,9 @@ HBITMAP RenderLegacySkinPreview(const skin::LegacySkin& source,
     caption += build::Version();
     if (!idle_caption.empty()) caption = idle_caption;
     const auto channel = LoadResourceText(resources, 0x81b7);
+    const HICON preview_icon = source.Icon() ? source.Icon() : fallback_icon;
     const skin::SkinLayers layers(PlayerSkinLayers(source.Elements(), false, 0,
-        FormatLedTime(std::chrono::milliseconds(0))), source.TransparentColor());
+        FormatLedTime(std::chrono::milliseconds(0)), preview_icon), source.TransparentColor());
     for (const auto& element : source.Elements()) {
         const skin::SkinLayerClip clip(target, layers, &element);
         if (IsSuppressedSkinControl(element.name)) continue;
@@ -2890,7 +2891,7 @@ HBITMAP RenderLegacySkinPreview(const skin::LegacySkin& source,
         }
         if (element.name == L"icon") {
             const HICON icon = source.Icon() ? source.Icon() : fallback_icon;
-            DrawSkinIcon(target, icon, element.bounds);
+            DrawSkinIcon(target, icon, skin::NativeSkinIconBounds(icon, element.bounds));
             continue;
         }
         if (element.name == L"progress" || element.name == L"volume") {
@@ -6298,7 +6299,7 @@ void PlayerWindow::ApplyOptionsRuntime(UINT template_id) {
         // icon path as command 33000/33001.
         ReloadApplicationIcons();
     }
-    if (all || template_id == 251 || template_id == 259 ||
+    if (all || template_id == 251 || template_id == 258 || template_id == 259 ||
         template_id == 260) {
         audio_->Configure({settings_.playback.file_buffer,
                           settings_.device.buffer_duration,
@@ -6322,7 +6323,13 @@ void PlayerWindow::ApplyOptionsRuntime(UINT template_id) {
                           nullptr,
                           settings_.playback.sound_fade_mode,
                           settings_.playback.fade_duration,
-                          settings_.playback.track_fade_duration});
+                          settings_.playback.track_fade_duration,
+                          {}, 15000, settings_.network.proxy_type, settings_.network.proxy_port,
+                          settings_.network.proxy_server, settings_.network.proxy_username,
+                          settings_.network.proxy_password,
+                          settings_.network.cache_enabled, settings_.network.cache_folder,
+                          settings_.network.cache_space_size, settings_.network.download_folder,
+                      (settings_.source_path.empty() ? PlayerRuntimeDirectory() : settings_.source_path.parent_path()) / L"HttpDownloads" / L"cachelist.xml"});
         audio_->SetVolume(settings_.player.mute ? 0.0F :
             static_cast<float>(settings_.player.volume) / 100.0F);
     }
@@ -6803,8 +6810,7 @@ void PlayerWindow::UpdateOptionsSkinDetails(HWND dialog) {
                 L"TTPlayerRebuild" /
                 (L"OptionsPreview-" +
                  std::to_wstring(package.Fingerprint()));
-            package.ExtractTo(cache, ttpcomm_module_);
-            auto preview = skin::LegacySkin::Load(cache);
+            auto preview = skin::LegacySkin::LoadPackage(package, cache, ttpcomm_module_);
             if (preview.Valid()) {
                 options_skin_preview_ = RenderSkinPreview(preview,
                     ResourceModule(), window_icon_small_, DefaultPlayerTitle());

@@ -26,6 +26,39 @@ bool ContainsRange(size_t size, size_t offset, size_t length) noexcept {
     return ttpcomm::bytes::Contains(size, offset, length);
 }
 
+bool SameEntryName(std::string_view left, std::string_view right) {
+    if (left.size() != right.size()) return false;
+    // Historical Windows ZIP writers use either separator. Materialization
+    // uses generic paths, so retain both spellings when looking up an entry.
+    for (size_t i = 0; i < left.size(); ++i) {
+        const char a = left[i] == '\\' ? '/' : left[i];
+        const char b = right[i] == '\\' ? '/' : right[i];
+        if (_strnicmp(&a, &b, 1) != 0) return false;
+    }
+    return true;
+}
+
+std::wstring DecodeEntryName(std::string_view name, uint16_t flags) {
+    if (name.empty() || name.find('\0') != name.npos || name.size() > INT_MAX) return {};
+    // 0041F5BA uses OemToCharBuffW before comparing resource names.
+    const UINT page = (flags & 0x800U) ? CP_UTF8 : CP_OEMCP;
+    const DWORD options = page == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0;
+    const int length = MultiByteToWideChar(page, options, name.data(), static_cast<int>(name.size()), nullptr, 0);
+    if (!length) return {};
+    std::wstring result(length, L'\0');
+    if (!MultiByteToWideChar(page, options, name.data(), static_cast<int>(name.size()), result.data(), length)) return {};
+    std::replace(result.begin(), result.end(), L'\\', L'/');
+    return result;
+}
+
+bool SameDecodedEntryName(std::wstring_view left, std::wstring_view right) {
+    if (left.empty() || left.size() != right.size() || left.size() > INT_MAX) return false;
+    std::wstring normalized(right);
+    std::replace(normalized.begin(), normalized.end(), L'\\', L'/');
+    return CompareStringW(LOCALE_INVARIANT, NORM_IGNORECASE, left.data(), static_cast<int>(left.size()),
+        normalized.data(), static_cast<int>(normalized.size())) == CSTR_EQUAL;
+}
+
 template <typename Function>
 Function TtpCommOrdinal(HMODULE module, WORD ordinal) noexcept {
     return module ? reinterpret_cast<Function>(
@@ -71,20 +104,29 @@ SkinPackage SkinPackage::Parse(std::vector<unsigned char> data,
         const auto record = ttpcomm::zip::ReadCentral({archive.data(), archive.size()}, offset);
         if (!record) throw std::runtime_error("invalid ZIP directory record");
         skin.entries_.push_back({std::string(record->name), record->packed, record->size,
-            record->local, record->method});
+            record->local, record->method, record->flags, DecodeEntryName(record->name, record->flags)});
         offset += record->record_size;
     }
     return skin;
 }
-bool SkinPackage::Has(std::string_view name) const { return std::ranges::any_of(entries_,[&](const auto& e){return _stricmp(e.name.c_str(),std::string(name).c_str())==0;}); }
+bool SkinPackage::Has(std::string_view name) const {
+    return std::ranges::any_of(entries_, [&](const auto& entry) {
+        return SameEntryName(entry.name, name);
+    });
+}
 
 std::vector<unsigned char> SkinPackage::ReadEntry(
     std::string_view name, HMODULE ttpcomm) const {
     const auto found = std::ranges::find_if(entries_, [&](const SkinEntry& entry) {
-        return entry.name.size() == name.size() &&
-            _strnicmp(entry.name.c_str(), name.data(), name.size()) == 0;
+        return SameEntryName(entry.name, name);
     });
     if (found == entries_.end()) throw std::runtime_error("ZIP entry not found");
+    return ReadEntry(*found, ttpcomm);
+}
+
+std::vector<unsigned char> SkinPackage::ReadEntry(
+    const SkinEntry& entry, HMODULE ttpcomm) const {
+    const auto* found = &entry;
 
     const size_t header = found->local_header_offset;
     if (!ContainsRange(data_.size(), header, 30) ||
@@ -92,6 +134,8 @@ std::vector<unsigned char> SkinPackage::ReadEntry(
         throw std::runtime_error("invalid ZIP local header");
     }
     const uint16_t flags = U16(data_.data() + header + 6);
+    if ((flags ^ found->flags) & 0x801U)
+        throw std::runtime_error("ZIP filename encoding/encryption flags differ");
     const uint16_t compression = U16(data_.data() + header + 8);
     const uint16_t name_size = U16(data_.data() + header + 26);
     const uint16_t extra_size = U16(data_.data() + header + 28);
@@ -194,7 +238,8 @@ void SkinPackage::ExtractTo(const std::filesystem::path& directory) const {
     std::filesystem::create_directories(directory);
     const auto complete = [&] {
         return std::ranges::all_of(entries_, [&](const SkinEntry& entry) {
-            const auto file = directory / std::filesystem::path(entry.name);
+            if (entry.decoded_name.empty()) return false;
+            const auto file = directory / std::filesystem::path(entry.decoded_name);
             std::error_code error;
             return std::filesystem::is_regular_file(file, error) && !error &&
                    std::filesystem::file_size(file, error) == entry.size && !error;
@@ -288,10 +333,9 @@ void SkinPackage::ExtractTo(const std::filesystem::path& directory,
     for (const auto& entry : entries_) {
         if (entry.name.empty())
             throw std::runtime_error("empty skin entry path");
-        // ZIP entry names are the legacy byte strings used by the original
-        // package reader.  std::filesystem::path performs the same active-code
-        // page conversion as the old Win32 build for non-ASCII names.
-        const std::filesystem::path relative(entry.name);
+        // Unflagged names retain the original OEM interpretation. Flagged
+        // UTF-8 names are decoded once without an intervening ANSI roundtrip.
+        const std::filesystem::path relative(entry.decoded_name);
         if (relative.empty() || relative.is_absolute() ||
             relative.has_root_name() || relative.has_root_directory()) {
             throw std::runtime_error("invalid absolute skin entry path");
@@ -302,25 +346,58 @@ void SkinPackage::ExtractTo(const std::filesystem::path& directory,
         }
 
         const auto target = directory / relative;
-        if (entry.name.back() == '/' || entry.name.back() == '\\') {
+        if (entry.decoded_name.back() == L'/') {
             std::filesystem::create_directories(target);
             continue;
         }
 
-        std::error_code error;
-        const bool current = std::filesystem::is_regular_file(target, error) &&
-            !error && std::filesystem::file_size(target, error) == entry.size &&
-            !error;
-        if (current) continue;
-
-        const auto contents = ReadEntry(entry.name, ttpcomm);
-        std::filesystem::create_directories(target.parent_path());
-        std::ofstream output(target, std::ios::binary | std::ios::trunc);
-        if (!output || (!contents.empty() &&
-            !output.write(reinterpret_cast<const char*>(contents.data()),
-                          static_cast<std::streamsize>(contents.size())))) {
-            throw std::runtime_error("cannot materialize skin entry");
-        }
+        ExtractEntryTo(directory, std::wstring_view(entry.decoded_name), ttpcomm);
     }
+}
+
+bool SkinPackage::ExtractEntryTo(const std::filesystem::path& directory,
+                                std::string_view name, HMODULE ttpcomm) const {
+    const auto found = std::ranges::find_if(entries_, [&](const SkinEntry& entry) {
+        return SameEntryName(entry.name, name);
+    });
+    // This overload is for callers holding a raw ZIP entry name. XML callers
+    // use the wide overload, preserving characters outside the active ACP.
+    if (found == entries_.end()) return false;
+    if (found->decoded_name.empty()) throw std::runtime_error("invalid skin entry encoding");
+    return ExtractEntryTo(directory, std::wstring_view(found->decoded_name), ttpcomm);
+}
+
+bool SkinPackage::ExtractEntryTo(const std::filesystem::path& directory,
+                                std::wstring_view name, HMODULE ttpcomm) const {
+    const std::filesystem::path relative(name);
+    if (relative.empty() || relative.has_root_path() || name.find(L':') != name.npos || name.find(L'\0') != name.npos)
+        throw std::runtime_error("invalid skin entry path");
+    for (const auto& component : relative) {
+        if (component == L"..") throw std::runtime_error("skin entry escapes cache directory");
+    }
+    const auto found = std::ranges::find_if(entries_, [&](const SkinEntry& entry) {
+        return SameDecodedEntryName(entry.decoded_name, name);
+    });
+    if (found == entries_.end()) return false;
+    // The original archive reader only opens referenced resources. Materialize
+    // one entry at a time, and never trust a same-length cache file's contents.
+    const auto contents = ReadEntry(*found, ttpcomm);
+    const auto target = directory / relative;
+    std::error_code error;
+    if (std::filesystem::is_regular_file(target, error) && !error &&
+        std::filesystem::file_size(target, error) == contents.size() && !error) {
+        std::ifstream input(target, std::ios::binary);
+        const std::vector<unsigned char> cached((std::istreambuf_iterator<char>(input)), {});
+        if (input && cached == contents) return true;
+    }
+    std::filesystem::create_directories(target.parent_path());
+    std::ofstream output(target, std::ios::binary | std::ios::trunc);
+    if (!output || (!contents.empty() &&
+        !output.write(reinterpret_cast<const char*>(contents.data()),
+                      static_cast<std::streamsize>(contents.size()))))
+        throw std::runtime_error("cannot materialize skin entry");
+    output.close();
+    if (!output) throw std::runtime_error("cannot finish skin entry");
+    return true;
 }
 }

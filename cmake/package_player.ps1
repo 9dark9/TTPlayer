@@ -41,8 +41,11 @@ $component = Get-Content -LiteralPath (Join-Path $output 'https-component.json')
 $httpsHash = (Get-FileHash -LiteralPath $https -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($component.repository -cne 'https://github.com/TTPlayerRebuild/TTPlayerHttps' -or
     $component.sha256 -cne $httpsHash -or
+    $component.required_abi -lt 7 -or $component.capabilities.max_abi -lt 7 -or
+    ($component.capabilities.features -band 0x3f) -ne 0x3f -or
+    (Get-Item -LiteralPath $https).VersionInfo.FileVersion -cne $component.version -or
     $component.inventories -notcontains '5.1.2600.txt' -or $component.inventories -notcontains '6.1.7600.txt') {
-    throw 'Download and verify the HTTPS release component before packaging.'
+    throw 'Build/download and verify an ABI 7 HTTPS component before packaging.'
 }
 New-Item -ItemType Directory -Path (Join-Path $package 'AddIn') | Out-Null
 Copy-Item -LiteralPath $https -Destination (Join-Path $package 'AddIn/ttp_https.dll')

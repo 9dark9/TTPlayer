@@ -523,7 +523,8 @@ std::wstring FormatInfoDuration(std::chrono::milliseconds duration);
 std::wstring FormatAudioDescription(const audio::AudioFormat& format);
 std::wstring FormatLedTime(std::chrono::milliseconds position);
 std::vector<skin::SkinLayer> PlayerSkinLayers(const std::vector<skin::SkinElement>& elements,
-    bool playing, int play_mode, std::wstring_view led_text);
+    bool playing, int play_mode, std::wstring_view led_text, HICON icon = nullptr,
+    std::optional<RECT> play_bounds = std::nullopt);
 void DrawSkinIcon(HDC dc, HICON icon, const RECT& bounds);
 RECT SkinLedBounds(const skin::SkinElement& led, std::wstring_view value);
 void DrawSkinLed(HDC dc, const skin::SkinElement& led, std::wstring_view value,

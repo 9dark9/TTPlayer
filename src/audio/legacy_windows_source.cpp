@@ -14,14 +14,15 @@ using Microsoft::WRL::ComPtr;
 
 class WindowsMediaSource final : public DecodedAudioSource {
 public:
-    explicit WindowsMediaSource(HMODULE ttpcomm) : ttpcomm_(ttpcomm) {}
+    WindowsMediaSource(HMODULE ttpcomm, IStream* input) : ttpcomm_(ttpcomm), stream_(input) {}
     ~WindowsMediaSource() override { if (reader_) reader_->Close(); }
 
     bool Open(const std::filesystem::path& path, const PlaybackOptions&) override {
         HRESULT result = platform::WMCreateSyncReader(nullptr, 0, &reader_);
         if (FAILED(result)) return Fail(L"Windows Media Format runtime is unavailable", result);
         ArchiveMemberPath member;
-        if (ParseArchiveMemberPath(path.native(), member)) {
+        if (stream_) result = reader_->OpenStream(stream_.Get());
+        else if (ParseArchiveMemberPath(path.native(), member)) {
             try {
                 stream_.Attach(OpenArchiveMemberStream(member, ttpcomm_));
             } catch (const ArchiveError& error) {
@@ -153,7 +154,7 @@ private:
 };
 } // namespace
 
-std::unique_ptr<DecodedAudioSource> CreateLegacyWindowsSource(HMODULE ttpcomm) {
-    return std::make_unique<WindowsMediaSource>(ttpcomm);
+std::unique_ptr<DecodedAudioSource> CreateLegacyWindowsSource(HMODULE ttpcomm, IStream* input) {
+    return std::make_unique<WindowsMediaSource>(ttpcomm, input);
 }
 } // namespace ttplayer::audio

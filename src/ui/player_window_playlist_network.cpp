@@ -6,6 +6,8 @@
 
 #include "player_window_internal.h"
 #include "ttplayer/ui/playlist_network_commands.h"
+#include "../app/resource_ids.h"
+#include "modern_file_dialog.h"
 
 #include <windows.h>
 
@@ -24,6 +26,71 @@ constexpr int kReportTrack = 2276;
 struct ReportDialogState {
     std::wstring track;
 };
+
+struct DownloadsDialogState {
+    audio::HttpDownloadQueue* queue;
+    std::filesystem::path folder;
+    bool artist_folder{},replace{};
+};
+INT_PTR CALLBACK DownloadsProc(HWND dialog, UINT message, WPARAM wparam, LPARAM lparam) {
+    auto* state=reinterpret_cast<DownloadsDialogState*>(GetWindowLongPtrW(dialog,DWLP_USER));
+    if(message==WM_INITDIALOG) {
+        SetWindowLongPtrW(dialog,DWLP_USER,lparam);
+        const auto list=GetDlgItem(dialog,IDC_HTTP_DOWNLOAD_LIST);
+        ListView_SetExtendedListViewStyle(list,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);
+        const wchar_t* names[]={L"歌曲",L"状态",L"已下载 / 总大小",L"保存位置"};
+        const int widths[]={150,115,140,260};
+        for(int i=0;i<4;++i){LVCOLUMNW c{};c.mask=LVCF_TEXT|LVCF_WIDTH;c.pszText=const_cast<wchar_t*>(names[i]);c.cx=widths[i];ListView_InsertColumn(list,i,&c);}
+        SetTimer(dialog,1,500,nullptr);SendMessageW(dialog,WM_TIMER,1,0);return TRUE;
+    }
+    if(!state) return FALSE;
+    const auto queue=state->queue;
+    if(message==WM_TIMER) {
+        const auto list=GetDlgItem(dialog,IDC_HTTP_DOWNLOAD_LIST);const int selected=ListView_GetNextItem(list,-1,LVNI_SELECTED);
+        LPARAM id{};if(selected>=0){LVITEMW item{};item.mask=LVIF_PARAM;item.iItem=selected;ListView_GetItem(list,&item);id=item.lParam;}
+        SendMessageW(list,WM_SETREDRAW,FALSE,0);ListView_DeleteAllItems(list);
+        for(const auto& job:queue->Snapshot()) {
+            if(job.prefetch) continue;
+            const auto title=job.display_title.empty()?job.entry.sourceurl:job.display_title;
+            LVITEMW item{};item.mask=LVIF_TEXT|LVIF_PARAM;item.iItem=ListView_GetItemCount(list);
+            item.pszText=const_cast<wchar_t*>(title.c_str());item.lParam=static_cast<LPARAM>(job.id);
+            const auto row=ListView_InsertItem(list,&item);
+            const wchar_t* statuses[]={L"等待",L"下载中",L"完成",L"已取消",L"失败",L"已停止"};
+            std::wstring status=statuses[static_cast<int>(job.state)];
+            if(job.state==audio::DownloadState::failed){wchar_t code[32];swprintf_s(code,L" (0x%08X)",static_cast<unsigned>(job.result));status+=code;}
+            auto bytes=std::to_wstring(job.received/1024)+L" / "+std::to_wstring(job.total/1024)+L" KiB";
+            auto path=job.destination.wstring();
+            ListView_SetItemText(list,row,1,status.data());ListView_SetItemText(list,row,2,bytes.data());ListView_SetItemText(list,row,3,path.data());
+            if(item.lParam==id) ListView_SetItemState(list,row,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
+        }
+        SendMessageW(list,WM_SETREDRAW,TRUE,0);InvalidateRect(list,nullptr,FALSE);
+        SetDlgItemTextW(dialog,IDC_HTTP_DOWNLOAD_STATUS,FAILED(queue->StorageResult())?
+            L"下载列表无法保存，或正由另一个播放器使用。":L"关闭窗口后继续下载。取消后的任务可重新下载并续传缓存。");
+        return TRUE;
+    }
+    if(message==WM_COMMAND) {
+        if(LOWORD(wparam)==IDCANCEL){EndDialog(dialog,IDCANCEL);return TRUE;}
+        if(LOWORD(wparam)==IDC_HTTP_DOWNLOAD_IMPORT) {
+            ModernOpenFileOptions options;options.owner=dialog;options.title=L"导入原版缓存索引或下载队列";
+            options.filters={{L"XML 列表",L"*.xml"},{L"所有文件",L"*.*"}};
+            if(const auto selected=ModernOpenFile(options)) {
+                const auto count=queue->ImportLegacyList(*selected,state->folder,state->artist_folder,state->replace);
+                const auto notice=count?L"已导入 "+std::to_wstring(count)+L" 个任务。未完成项已停止，可选择后点击“重新下载”。":L"没有可导入的任务：列表可能已存在、格式不兼容或来源不是 HTTP/HTTPS。";
+                MessageBoxW(dialog,notice.c_str(),L"导入旧列表",MB_OK|MB_ICONINFORMATION);
+            }return TRUE;
+        }
+        const auto list=GetDlgItem(dialog,IDC_HTTP_DOWNLOAD_LIST);LVITEMW item{};item.mask=LVIF_PARAM;
+        item.iItem=ListView_GetNextItem(list,-1,LVNI_SELECTED);
+        if(item.iItem>=0 && ListView_GetItem(list,&item)) {
+            if(LOWORD(wparam)==IDC_HTTP_DOWNLOAD_CANCEL) queue->Cancel(item.lParam);
+            if(LOWORD(wparam)==IDC_HTTP_DOWNLOAD_RETRY) queue->Retry(item.lParam);
+        }
+        SendMessageW(dialog,WM_TIMER,1,0);return TRUE;
+    }
+    if(message==WM_CLOSE){EndDialog(dialog,IDCANCEL);return TRUE;}
+    if(message==WM_DESTROY) KillTimer(dialog,1);
+    return FALSE;
+}
 
 INT_PTR CALLBACK ReportDialogProc(HWND dialog, UINT message,
                                   WPARAM wparam, LPARAM lparam) {
@@ -63,6 +130,60 @@ INT_PTR CALLBACK ReportDialogProc(HWND dialog, UINT message,
 }
 
 } // namespace
+
+void PlayerWindow::ConfigureNetworkDownloads() {
+    if(!network_downloads_) {
+        const auto root=settings_.source_path.empty()?PlayerRuntimeDirectory():settings_.source_path.parent_path();
+        network_downloads_=std::make_unique<audio::HttpDownloadQueue>(root/L"HttpDownloads"/L"cachelist.xml");
+    }
+    audio::PlaybackOptions options;
+    options.network_proxy_type=settings_.network.proxy_type;options.network_proxy_port=settings_.network.proxy_port;
+    options.network_proxy_server=settings_.network.proxy_server;options.network_proxy_username=settings_.network.proxy_username;
+    options.network_proxy_password=settings_.network.proxy_password;
+    options.network_cache_enabled=settings_.network.cache_enabled;options.network_cache_folder=settings_.network.cache_folder;
+    options.network_cache_space_mb=settings_.network.cache_space_size;
+    network_downloads_->Configure(options,settings_.network.max_download_tasks);
+}
+void PlayerWindow::QueueNetworkDownload(const playlist::Track& track) {
+    const auto url=audio::HttpDownloadKey(track.path.wstring());if(url.empty() || settings_.network.download_folder.empty()) return;
+    const auto title=core::Utf8ToWide(track.title),artist=core::Utf8ToWide(track.artist);
+    auto destination=audio::HttpDownloadDestination(settings_.network.download_folder,url,title,artist,settings_.network.create_folder_by_artist);
+    network_downloads_->Enqueue(url,title,std::move(destination),settings_.network.replace_file,artist);
+}
+void PlayerWindow::ShowNetworkDownloads() {
+    if(network_download_dialog_open_) return;
+    network_download_dialog_open_=true;
+    DownloadsDialogState state{network_downloads_.get(),settings_.network.download_folder,
+        settings_.network.create_folder_by_artist,settings_.network.replace_file};
+    ShowWtlModalDialog(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(IDD_HTTP_DOWNLOADS),
+        playlist_window_?playlist_window_:window_,DownloadsProc,reinterpret_cast<LPARAM>(&state));
+    network_download_dialog_open_=false;
+}
+void PlayerWindow::PollNetworkDownloads() {
+    ConfigureNetworkDownloads();
+    const auto state=audio_->State();
+    const bool active=state==audio::PlaybackState::opening || state==audio::PlaybackState::playing || state==audio::PlaybackState::paused;
+    const auto url=active && opened_track_?audio::HttpDownloadKey(opened_track_->path.wstring()):std::wstring{};
+    if(settings_.network.download_when_listen && !url.empty() && url!=network_auto_download_url_ && playback_source_open_) {
+        QueueNetworkDownload(*opened_track_);network_auto_download_url_=url;
+    }
+    if(!settings_.network.download_when_listen || url.empty()) network_auto_download_url_.clear();
+    std::wstring next;
+    // 00460904: modes 0/1 have no successor; sequential modes do not wrap this
+    // speculative request at the last row. Random preview must not advance it.
+    if(active && playback_source_open_ && settings_.network.cache_enabled &&
+       network_prefetch_after_ && GetTickCount64()>=network_prefetch_after_ && HasPlaybackTrack()) {
+        const auto& tracks=PlaybackPlaylist().Tracks();std::optional<size_t> row;
+        if((settings_.player.play_mode==2 || settings_.player.play_mode==3) && *current_+1<tracks.size()) row=*current_+1;
+        else if(settings_.player.play_mode==4) {
+            PrepareRandomPlaybackOrder();const auto preview=random_playback_order_.TrySelect(
+                NavigationTrackCount(),NavigationPlayingRow(),playlist::RandomPlaybackOrder::Request::preview_next);
+            if(!preview.pending) row=preview.row;
+        }
+        if(row && *row<tracks.size() && *row!=*current_) next=audio::HttpDownloadKey(tracks[*row].path.wstring());
+    }
+    network_downloads_->Prefetch(next);
+}
 
 void PlayerWindow::QueryDiscInformation(const std::filesystem::path& path, bool automatic) {
     if (disc_query_active_) return;
@@ -147,6 +268,13 @@ bool PlayerWindow::HandleLegacyPlaylistNetworkCommand(UINT command) {
     if (action == LegacyPlaylistNetworkAction::freedb) {
         QueryDiscInformation(track->path);
         return true;
+    }
+
+    if(action==LegacyPlaylistNetworkAction::download) {
+        ConfigureNetworkDownloads();
+        if(playlist_selected_rows_.empty()) QueueNetworkDownload(*track);
+        else for(auto selected:playlist_selected_rows_) if(const auto* item=VisiblePlaylistTrack(selected)) QueueNetworkDownload(*item);
+        ShowNetworkDownloads();return true;
     }
 
     if (action == LegacyPlaylistNetworkAction::report) {

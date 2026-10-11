@@ -591,6 +591,14 @@ RECT PlaylistToolbarItemBounds(const skin::PlaylistSkin& layout, RECT toolbar,
         IntersectRect(&clipped, &item, &toolbar);
         return clipped;
     }
+    if (!layout.toolbar.image) {
+        // 0047AB54 derives the native button width from the XML control,
+        // independently of the generated 32x16 label image. Remainder
+        // pixels at the right edge do not belong to another button.
+        const LONG cell_width = (toolbar.right - toolbar.left) / 7;
+        return {toolbar.left + static_cast<LONG>(index) * cell_width, toolbar.top,
+            toolbar.left + static_cast<LONG>(index + 1) * cell_width, toolbar.bottom};
+    }
     const int width = toolbar.right - toolbar.left;
     RECT item{toolbar.left + static_cast<int>(index) * width / 7, toolbar.top,
         toolbar.left + static_cast<int>(index + 1) * width / 7, toolbar.bottom};
@@ -855,25 +863,11 @@ HRGN CreateColorKeyRegion(HBITMAP bitmap, int width, int height,
 void ApplySkinButtonRegion(HWND window, const skin::SkinElement& element,
                            COLORREF transparent) {
     if (!window) return;
-    // 00452FFF -> 0040A1DD: even when a later SetWindowPos restores a
-    // larger XML rectangle, SkinButton keeps the first frame's colour-key
-    // region. Without it a padded sibling can cover the next button.
-    const auto image = element.image.IsGdiPlus()
-        ? element.image.CoverageMask() : element.image;
-    HRGN region = CreateColorKeyRegion(image, element.image_size.cx,
-        element.image_size.cy,
-        element.image.IsGdiPlus() ? RGB(0, 0, 0) : transparent);
-    if (region) {
-        const HRGN frame = CreateRectRgn(0, 0,
-            element.image_size.cx / std::max(1, element.frames), element.image_size.cy);
-        if (frame) {
-            CombineRgn(region, region, frame, RGN_AND);
-            DeleteObject(frame);
-        } else {
-            DeleteObject(region);
-            region = nullptr;
-        }
-    }
+    // 00452FFF -> 0040A1DD: normal-frame palette/key region, unless the
+    // indexed path disables the key. In that case the entire HWND (including
+    // XML padding) stays rectangular, just like an unkeyed BMP button.
+    HRGN region = element.image.IsGdiPlus() || element.image.ButtonColorKey(transparent) != CLR_INVALID
+        ? element.image.CreateRegion(transparent, 4) : nullptr;
     if (!SetWindowRgn(window, region, FALSE) && region) DeleteObject(region);
 }
 
@@ -948,6 +942,7 @@ void DrawElementFrame(HDC target, const skin::SkinElement& element, RECT bounds,
                                               : bounds.right - bounds.left;
     const int destination_height = frames > 1 ? element.image_size.cy
                                                : bounds.bottom - bounds.top;
+    if (element.four_state) transparent = element.image.ButtonColorKey(transparent);
     element.image.Draw(target, bounds.left, bounds.top, destination_width,
                        destination_height, state * frame_width, 0,
                        frame_width, element.image_size.cy, transparent);
@@ -995,7 +990,7 @@ PlaylistGeometry MakePlaylistGeometry(const skin::PlaylistSkin& layout,
     // its item count exceeds the page.  Reserving this strip unconditionally
     // shortens a one-row selection by 15 px in LX-iPlay (9 px in TT2012).
     result.scrollbar_width = track_count > static_cast<size_t>(result.page_rows)
-        ? (layout.scrollbar_buttons.size.cx >= 3 ? layout.scrollbar_buttons.size.cx / 3 : 13) : 0;
+        ? (layout.HasSkinnedScrollbar() ? layout.scrollbar_buttons.size.cx / 3 : 13) : 0;
     // SplitterCtrl retains its five-pixel default renderer when a skin omits
     // splitter_bar_image (TT2012); image-backed skins use the native width.
     const int splitter_width = layout.splitter_bar.image
@@ -1013,7 +1008,7 @@ PlaylistGeometry MakePlaylistGeometry(const skin::PlaylistSkin& layout,
                      result.scrollbar_width ? result.scrollbar.left : result.list.right,
                      result.list.bottom};
     if (!library_mode && list_count > static_cast<size_t>(result.page_rows)) {
-        const int bar_width = layout.scrollbar_buttons.size.cx >= 3
+        const int bar_width = layout.HasSkinnedScrollbar()
             ? layout.scrollbar_buttons.size.cx / 3 : 13;
         if (result.list_titles.right - result.list_titles.left > bar_width) {
             result.list_scrollbar = {result.list_titles.right - bar_width, result.list_titles.top,
@@ -1023,11 +1018,6 @@ PlaylistGeometry MakePlaylistGeometry(const skin::PlaylistSkin& layout,
     }
     result.toolbar = ResolveAlignedRect(layout.toolbar_bounds, layout.toolbar_alignment,
                                         layout.background.size, width, height);
-    if (!layout.toolbar.image && !IsRectEmpty(&result.toolbar)) {
-        // 0047E512 synthesizes seven 32 x 16 menu-label cells.
-        result.toolbar.right = result.toolbar.left + 7 * 32;
-        result.toolbar.bottom = result.toolbar.top + 16;
-    }
     result.close = ResolveAlignedRect(layout.close.bounds, layout.close.alignment,
                                       layout.background.size, width, height);
     result.title = ResolveAlignedRect(layout.title.bounds, layout.title.alignment,
@@ -1086,6 +1076,8 @@ bool IsPlayModeSkinVisible(std::wstring_view name, int mode) {
 }
 
 HFONT CreateSkinFont(const skin::SkinElement& element) {
+    // 004AA061 leaves HFONT null when the face is absent.
+    if (element.font.empty()) return nullptr;
     NONCLIENTMETRICSW metrics{sizeof(metrics)};
     LOGFONTW descriptor{};
     if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, 0, &metrics, 0)) {
@@ -1106,7 +1098,7 @@ HFONT CreateSkinFont(const skin::SkinElement& element) {
 }
 
 std::vector<skin::SkinLayer> PlayerSkinLayers(const std::vector<skin::SkinElement>& elements,
-    bool playing, int play_mode, std::wstring_view led_text) {
+    bool playing, int play_mode, std::wstring_view led_text, HICON icon, std::optional<RECT> play_bounds) {
     std::vector<skin::SkinLayer> result;
     const auto play = std::find_if(elements.begin(), elements.end(),
         [](const auto& element) { return element.name == L"play"; });
@@ -1114,16 +1106,28 @@ std::vector<skin::SkinLayer> PlayerSkinLayers(const std::vector<skin::SkinElemen
         if (skin::PlayerSkinOrder(element.name) < 0 || IsSuppressedSkinControl(element.name) ||
             !IsPlayModeSkinVisible(element.name, play_mode)) continue;
         if ((element.name == L"play" && playing) || (element.name == L"pause" && !playing)) continue;
-        if (element.four_state && !element.image) continue;
+        // 0040A1DD keeps a rectangular child when image loading fails. Its
+        // empty background still clips lower siblings and receives the mouse.
         if (element.name == L"led" && !element.image) continue;
         RECT bounds = element.bounds;
+        if (element.name == L"icon") bounds = skin::NativeSkinIconBounds(icon, bounds);
         if (element.name == L"led") bounds = SkinLedBounds(element, led_text);
-        if (element.name == L"pause" && play != elements.end()) {
-            bounds = {play->bounds.left, play->bounds.top,
-                play->bounds.left + element.image_size.cx / 4,
-                play->bounds.top + element.image_size.cy};
+        if ((element.name == L"play" || element.name == L"pause") && play != elements.end()) {
+            if (play_bounds) bounds = *play_bounds;
+            else if (element.name == L"pause") {
+                bounds = play->bounds;
+                if (element.image) {
+                    bounds.right = bounds.left + element.image_size.cx / 4;
+                    bounds.bottom = bounds.top + element.image_size.cy;
+                }
+            }
         }
-        if (!IsRectEmpty(&bounds)) result.push_back({&element, bounds});
+        // 0044E50C/00467B9B: SkinButton/SkinIcon have WS_CLIPSIBLINGS;
+        // labels, LED, visualization and sliders do not. A full redraw can
+        // therefore cover a higher button while that button still receives
+        // the mouse. Keep this distinct from the input order.
+        if (!IsRectEmpty(&bounds)) result.push_back({&element, bounds, 0,
+            element.four_state || element.name == L"icon"});
     }
     std::stable_sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
         return skin::PlayerSkinOrder(a.element->name) < skin::PlayerSkinOrder(b.element->name);
@@ -1132,19 +1136,7 @@ std::vector<skin::SkinLayer> PlayerSkinLayers(const std::vector<skin::SkinElemen
 }
 
 void DrawSkinIcon(HDC dc, HICON icon, const RECT& bounds) {
-    ICONINFO info{};
-    if (!icon || !GetIconInfo(icon, &info)) return;
-    BITMAP bitmap{};
-    GetObjectW(info.hbmColor ? info.hbmColor : info.hbmMask, sizeof(bitmap), &bitmap);
-    if (!info.hbmColor) bitmap.bmHeight /= 2;
-    if (info.hbmColor) DeleteObject(info.hbmColor);
-    if (info.hbmMask) DeleteObject(info.hbmMask);
-    const int saved = SaveDC(dc);
-    IntersectClipRect(dc, bounds.left, bounds.top, bounds.right, bounds.bottom);
-    DrawIconEx(dc, bounds.left + (bounds.right - bounds.left - bitmap.bmWidth) / 2,
-        bounds.top + (bounds.bottom - bounds.top - bitmap.bmHeight) / 2,
-        icon, bitmap.bmWidth, bitmap.bmHeight, 0, nullptr, DI_NORMAL);
-    if (saved) RestoreDC(dc, saved);
+    skin::DrawNativeSkinIcon(dc, icon, bounds);
 }
 
 void DrawSkinText(HDC dc, const skin::SkinElement& element, const wchar_t* text) {
@@ -1154,7 +1146,7 @@ void DrawSkinText(HDC dc, const skin::SkinElement& element, const wchar_t* text)
         DeleteObject(brush);
     }
     const HFONT font = CreateSkinFont(element);
-    const HGDIOBJ old_font = font ? SelectObject(dc, font) : nullptr;
+    const HGDIOBJ old_font = SelectObject(dc, font ? font : GetStockObject(SYSTEM_FONT));
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, element.color);
     UINT format = DT_SINGLELINE | DT_NOPREFIX;
@@ -1170,10 +1162,8 @@ void DrawSkinText(HDC dc, const skin::SkinElement& element, const wchar_t* text)
     format |= _wcsicmp(element.name.c_str(), L"info") == 0 ? DT_VCENTER : DT_TOP;
     RECT bounds = element.bounds;
     DrawTextW(dc, text, -1, &bounds, format);
-    if (font) {
-        SelectObject(dc, old_font);
-        DeleteObject(font);
-    }
+    SelectObject(dc, old_font);
+    if (font) DeleteObject(font);
 }
 
 COLORREF BlendColor(COLORREF from, COLORREF to, int amount, int total) {
@@ -1204,7 +1194,7 @@ void DrawScrollingSkinInfo(HDC dc, const skin::SkinElement& element,
         IntersectClipRect(dc, element.bounds.left, element.bounds.top,
                           element.bounds.right, element.bounds.bottom);
     }
-    const HGDIOBJ selected = font ? SelectObject(dc, font) : nullptr;
+    const HGDIOBJ selected = SelectObject(dc, font ? font : GetStockObject(SYSTEM_FONT));
     SetBkMode(dc, TRANSPARENT);
     const COLORREF color = element.background == 0xff000000
         ? element.color
@@ -1225,7 +1215,7 @@ void DrawScrollingSkinInfo(HDC dc, const skin::SkinElement& element,
         OffsetRect(&bounds, 0, height);
         DrawTextW(dc, next, -1, &bounds, format);
     }
-    if (font) SelectObject(dc, selected);
+    SelectObject(dc, selected);
     if (saved != 0) RestoreDC(dc, saved);
     if (font) DeleteObject(font);
 }
@@ -1521,13 +1511,20 @@ PlayerWindow::PlayerWindow(settings::Settings settings) : settings_(std::move(se
                       nullptr,
                       settings_.playback.sound_fade_mode,
                       settings_.playback.fade_duration,
-                      settings_.playback.track_fade_duration});
+                      settings_.playback.track_fade_duration,
+                      {}, 15000, settings_.network.proxy_type, settings_.network.proxy_port,
+                      settings_.network.proxy_server, settings_.network.proxy_username,
+                      settings_.network.proxy_password,
+                      settings_.network.cache_enabled, settings_.network.cache_folder,
+                      settings_.network.cache_space_size, settings_.network.download_folder,
+                      (settings_.source_path.empty() ? PlayerRuntimeDirectory() : settings_.source_path.parent_path()) / L"HttpDownloads" / L"cachelist.xml"});
     audio_->SetVolume(settings_.player.mute ? 0.0F : static_cast<float>(settings_.player.volume) / 100.0F);
     discord_presence_.Configure(settings_.general.send_title_to_msn,
                                 settings_.general.discord_application_id);
 }
 
 PlayerWindow::~PlayerWindow() {
+    network_downloads_.reset();
     CancelUpdateCheck();
     external_skin_.reset();
     system_media_controls_.Reset();
@@ -2426,8 +2423,7 @@ bool PlayerWindow::LoadSkin(skin::SkinPackage package,
                             const std::wstring& selector,
                             const std::filesystem::path& profile, bool restore_profile) {
     if (!package.IsLegacyCompatible()) return false;
-    package.ExtractTo(cache, ttpcomm_module_);
-    auto next = skin::LegacySkin::Load(cache, &settings_);
+    auto next = skin::LegacySkin::LoadPackage(package, cache, ttpcomm_module_, &settings_);
     if (!next.Valid()) return false;
     if (!next.DesktopLyricBar().background.image) {
         // 00449451 -> 004459CF: older packages such as PurpleMyth have no
@@ -2439,8 +2435,8 @@ bool PlayerWindow::LoadSkin(skin::SkinPackage package,
             const auto fallback_cache = std::filesystem::temp_directory_path() /
                 L"TTPlayerRebuild" / (L"DefaultSkin-resource-" +
                 std::to_wstring(fallback_package.Fingerprint()));
-            fallback_package.ExtractTo(fallback_cache, ttpcomm_module_);
-            const auto fallback = skin::LegacySkin::Load(fallback_cache, &settings_);
+            const auto fallback = skin::LegacySkin::LoadPackage(
+                fallback_package, fallback_cache, ttpcomm_module_, &settings_);
             next.ApplyDesktopLyricBarFallback(fallback);
         } catch (const std::exception&) {
             // A missing resource DLL must not prevent a valid external skin
@@ -2495,6 +2491,8 @@ bool PlayerWindow::LoadSkin(skin::SkinPackage package,
     auto previous = std::move(skin_);
     ResetSkinControlAnimations();
     skin_.emplace(std::move(next));
+    play_button_layout_ = nullptr;
+    last_skin_mouse_down_target_.reset();
     // Load the target configuration before presenting it. The old menu path
     // applied the package, repainted/recreated its controls, then loaded the
     // sidecar and applied everything again with a second set of HWNDs.
@@ -2604,7 +2602,9 @@ void PlayerWindow::ApplyApplicationIcons() {
     const HICON skin_icon = settings_.general.app_icon_file.empty() && skin_
         ? skin_->Icon() : nullptr;
     const HICON small_icon = skin_icon ? skin_icon : window_icon_small_;
-    const HICON large_icon = skin_icon ? skin_icon : window_icon_big_;
+    const HICON skin_large = settings_.general.app_icon_file.empty() && skin_
+        ? skin_->Icon(false, true) : nullptr;
+    const HICON large_icon = skin_large ? skin_large : window_icon_big_;
     // The class is private to the player. Refresh it too: otherwise the
     // taskbar's fallback can retain the icon installed at RegisterClassEx.
     SetClassLongPtrW(window_, GCLP_HICONSM, reinterpret_cast<LONG_PTR>(small_icon));
@@ -2612,6 +2612,7 @@ void PlayerWindow::ApplyApplicationIcons() {
     SendMessageW(window_, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small_icon));
     SendMessageW(window_, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(large_icon));
     taskbar_icon_file_ = PublishTaskbarIcon(window_, small_icon, large_icon, DefaultPlayerTitle());
+    desktop_lyrics_.SetSkin(skin_ ? &*skin_ : nullptr, window_icon_small_);
     UpdateTrayIcon();
     InvalidateRect(window_, nullptr, FALSE);
 }
@@ -2678,7 +2679,10 @@ bool PlayerWindow::Create(HINSTANCE instance, int show_command) {
     // capture, focus, local mouse coordinates, and the TTF_IDISHWND tooltip
     // registration used by FUN_0040EE49.
     WNDCLASSEXW equalizer_control_type{sizeof(equalizer_control_type)};
-    equalizer_control_type.style = CS_DBLCLKS;
+    // 5.7.9 SkinButton has no CS_DBLCLKS: its second fast press is another
+    // WM_LBUTTONDOWN. Registering it with double clicks can lose that press
+    // after the first click clears a checked state.
+    equalizer_control_type.style = 0;
     equalizer_control_type.lpfnWndProc = EqualizerControlProc;
     equalizer_control_type.hInstance = instance;
     equalizer_control_type.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -2686,6 +2690,7 @@ bool PlayerWindow::Create(HINSTANCE instance, int show_command) {
     equalizer_control_type.lpszClassName = kEqualizerButtonClass;
     if (!RegisterClassExW(&equalizer_control_type) &&
         GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+    equalizer_control_type.style = 0; // SkinSlider: second fast click is a DOWN.
     equalizer_control_type.lpszClassName = kEqualizerSliderClass;
     if (!RegisterClassExW(&equalizer_control_type) &&
         GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
@@ -3094,9 +3099,30 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
         if (wparam) Paint(reinterpret_cast<HDC>(wparam));
         return 0;
     case WM_PAINT: {
+        // A native child invalidation repaints that child alone. Only use the
+        // pending element set if the update region contains no parent damage.
+        const HRGN update = CreateRectRgn(0, 0, 0, 0);
+        const HRGN pending = CreateRectRgn(0, 0, 0, 0);
+        bool partial = skin_ && !external_skin_ && !dirty_skin_elements_.empty();
+        if (partial) {
+            GetUpdateRgn(window_, update, FALSE);
+            for (const auto& name : dirty_skin_elements_) if (const auto* element = FindActiveSkinElement(name)) {
+                const RECT rect = MainSkinButtonBounds(name);
+                const HRGN bounds = CreateRectRgnIndirect(&rect);
+                CombineRgn(pending, pending, bounds, RGN_OR);
+                DeleteObject(bounds);
+            }
+            CombineRgn(update, update, pending, RGN_DIFF);
+            RECT bounds{};
+            partial = GetRgnBox(update, &bounds) == NULLREGION;
+        }
+        DeleteObject(update);
+        DeleteObject(pending);
+        auto repaint = std::exchange(dirty_skin_elements_, {});
         PAINTSTRUCT paint{};
         const HDC dc = BeginPaint(window_, &paint);
-        Paint(dc);
+        if (partial) PaintSkin(dc, &repaint);
+        else Paint(dc);
         EndPaint(window_, &paint);
         return 0;
     }
@@ -3139,29 +3165,60 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
                 ContinueSkinBackgroundDrag(window_, point);
                 return 0;
             }
+            if (HandleMainSkinSliderMessage(message, wparam, lparam)) return 0;
             const auto hit = HitTestSkin(point);
+            if (pressed_skin_element_ != L"volume" && pressed_skin_element_ != L"progress") {
+                auto target = std::wstring(ActiveMainSkinButton(captured_skin_button_));
+                if (target.empty()) {
+                    if (const auto* element = FindActiveSkinElement(hit); element && element->four_state)
+                        target = hit;
+                }
+                if (!target.empty()) {
+                    auto& button = MainSkinButton(target);
+                    const auto previous = button;
+                    const bool inside = button.enabled && MainSkinButtonContains(target, point);
+                    if (inside) {
+                        if (GetCapture() != window_) SetCapture(window_);
+                        captured_skin_button_ = target;
+                    } else if (!(wparam & MK_LBUTTON) && GetCapture() == window_) {
+                        ReleaseCapture();
+                    }
+                    button.Move(inside, (wparam & MK_LBUTTON) != 0);
+                    hover_skin_element_ = inside ? target : L"";
+                    if (previous != button) InvalidateSkinElement(target);
+                    return 0;
+                }
+            }
             if (hit != hover_skin_element_) {
+                const auto previous = hover_skin_element_;
                 hover_skin_element_ = hit;
-                InvalidateRect(window_, nullptr, FALSE);
+                // A slider with no thumb has no hot frame. Invalidating its
+                // track here would erase an overlapping button, unlike the
+                // native child which has no visual change on this move.
+                for (const auto& name : {previous, hit})
+                    if (const auto* element = FindActiveSkinElement(name);
+                        element && (element->four_state || element->thumb_image))
+                        InvalidateSkinElement(name);
             }
             TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window_, 0};
             TrackMouseEvent(&tracking);
-            if (!pressed_skin_element_.empty() && pressed_skin_element_ == L"volume") {
-                SetSkinVolumeFromPoint(point);
-            } else if (pressed_skin_element_ == L"progress") {
-                SetSkinProgressFromPoint(point);
-            }
             return 0;
         }
         break;
     case WM_MOUSELEAVE:
+        if (!captured_skin_button_.empty() && GetCapture() == window_) return 0;
+        if (const auto* element = FindActiveSkinElement(hover_skin_element_);
+            element && (element->four_state || element->thumb_image))
+            InvalidateSkinElement(hover_skin_element_);
         hover_skin_element_.clear();
-        InvalidateRect(window_, nullptr, FALSE);
         return 0;
     case WM_LBUTTONDOWN:
         if (skin_) {
+            if (HandleMainSkinSliderMessage(message, wparam, lparam)) return 0;
             POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
             pressed_skin_element_ = HitTestSkin(point);
+            last_skin_mouse_down_target_ = pressed_skin_element_ == L"pause"
+                ? L"play" : pressed_skin_element_;
             if (pressed_skin_element_.empty()) {
                 // FUN_0044F670/FUN_0046EAAC records the client anchor and
                 // uses client capture. It does not synthesize a caption
@@ -3171,45 +3228,49 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
                 dragging_skin_background_ = false;
                 // 004347EE: the original info child neither captures the
                 // mouse nor starts a parent drag on WM_LBUTTONDOWN.
-                if (pressed_skin_element_ != L"info") SetCapture(window_);
-                if (pressed_skin_element_ == L"volume") SetSkinVolumeFromPoint(point);
-                else if (pressed_skin_element_ == L"progress") SetSkinProgressFromPoint(point);
-                InvalidateRect(window_, nullptr, FALSE);
+                if (const auto* element = FindActiveSkinElement(pressed_skin_element_);
+                         element && element->four_state) {
+                    focused_skin_slider_.clear();
+                    if (GetCapture() != window_) SetCapture(window_);
+                    captured_skin_button_ = pressed_skin_element_;
+                    auto& button = MainSkinButton(captured_skin_button_);
+                    const auto previous = button;
+                    button.Down();
+                    if (previous != button) InvalidateSkinElement(pressed_skin_element_);
+                    return 0;
+                }
+                InvalidateSkinElement(pressed_skin_element_);
             }
             return 0;
         }
         break;
     case WM_LBUTTONUP:
         if (skin_) {
+            if (HandleMainSkinSliderMessage(message, wparam, lparam)) return 0;
             POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
             const auto released = HitTestSkin(point);
-            const auto action = std::exchange(pressed_skin_element_, {});
+            const auto action = !captured_skin_button_.empty() ? std::wstring(ActiveMainSkinButton(captured_skin_button_))
+                : std::exchange(pressed_skin_element_, {});
+            const bool button_action = !captured_skin_button_.empty();
+            const auto button_before = button_action
+                ? std::optional<skin::SkinButtonState>(MainSkinButton(action)) : std::nullopt;
+            const bool invoke_button = button_action && MainSkinButton(action).Release(
+                MainSkinButtonContains(action, point));
             // 004096AE -> 00409AC8 advances on the info child's release,
             // including a release without a preceding press in that child.
             // A captured button/slider or background drag still owns its up.
-            const bool info_release = released == L"info" &&
-                (action.empty() || action == L"info") &&
+            const bool simple_release = (released == L"info" || released == L"led" || released == L"icon") &&
+                !button_action &&
                 !dragging_skin_background_ && GetCapture() != window_;
-            if (action == L"progress" && GetCapture() == window_) {
-                // 00460AB1 commits only SB_THUMBPOSITION (4), not the
-                // intermediate tracking notifications. Use the release point
-                // even if it lies outside the control or no move preceded it.
-                SetSkinProgressFromPoint(point);
-                if (progress_tracking_position_) {
-                    audio_->SeekWithoutFade(*progress_tracking_position_);
-                    UpdateDiscordPresence();
-                }
-            }
-            if (action == L"volume" || action == L"progress")
-                SetSliderStatus({}); // 00452295 -> 00460AB1: SB_THUMBPOSITION
             EndSkinMouseCapture();
-            if (info_release) {
-                InvokeSkinAction(L"info");
-            } else if (!action.empty() && action == released && action != L"info" &&
+            if (simple_release) {
+                InvokeSkinAction(released);
+            } else if (!action.empty() && (button_action ? invoke_button : action == released) && action != L"info" &&
                        action != L"volume" && action != L"progress") {
                 InvokeSkinAction(action);
             }
-            InvalidateRect(window_, nullptr, FALSE);
+            if (!button_before || *button_before != MainSkinButton(action))
+                InvalidateSkinElement(action);
             return 0;
         }
         break;
@@ -3220,6 +3281,16 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
             // must not fall through to the main background double-click.
             const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
             const auto hit = HitTestSkin(point);
+            const auto target = hit == L"pause" ? std::wstring(L"play") : hit;
+            // Native skin children have independent double-click histories.
+            // Our logical controls share the main HWND, so User32 may report
+            // a double click across a button/background boundary. That is a
+            // new DOWN for the original recipient, not a background double
+            // click. SkinButton's class also delivers two ordinary clicks.
+            const auto* element = FindActiveSkinElement(hit);
+            if ((last_skin_mouse_down_target_ && *last_skin_mouse_down_target_ != target) ||
+                (element && hit != L"info"))
+                return HandleMessage(WM_LBUTTONDOWN, wparam, lparam);
             if (hit == L"info") {
                 EndSkinMouseCapture();
                 // 0040FA41 sends the text control's STN_DBLCLK notification.
@@ -3230,8 +3301,32 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
             return 0;
         }
         break;
+    case WM_KEYDOWN:
+        if (skin_ && HandleMainSkinSliderMessage(message, wparam, lparam)) return 0;
+        break;
     case WM_CAPTURECHANGED:
         if (skin_) {
+            if (!captured_skin_slider_.empty()) {
+                const auto slider = std::exchange(captured_skin_slider_, {});
+                if (slider == L"volume" && main_skin_sliders_[slider].dragging)
+                    SetVolumeTrackingStatus(false);
+                main_skin_sliders_[slider].Cancel();
+                progress_tracking_position_.reset();
+                pressed_skin_element_.clear();
+                InvalidateSkinElement(slider);
+            }
+            const auto button = std::exchange(captured_skin_button_, {});
+            if (!button.empty()) {
+                // Capture loss resets the stored frame before WM_ENABLE; it
+                // does not resync enablement while cancelling the old state.
+                auto& state = main_skin_buttons_[button == L"pause" ? L"play" : button];
+                const auto previous = state;
+                state.Cancel();
+                pressed_skin_element_.clear();
+                hover_skin_element_.clear();
+                if (previous != state) InvalidateSkinElement(button);
+                return 0;
+            }
             if (pressed_skin_element_ == L"volume" || pressed_skin_element_ == L"progress")
                 SetSliderStatus({});
             progress_tracking_position_.reset();
@@ -3239,8 +3334,8 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
             skin_drag_window_ = nullptr;
             skin_drag_hit_ = 0;
             attached_drag_windows_.clear();
-            pressed_skin_element_.clear();
-            InvalidateRect(window_, nullptr, FALSE);
+            const auto previous = std::exchange(pressed_skin_element_, {});
+            InvalidateSkinElement(previous);
             return 0;
         }
         break;
@@ -3248,9 +3343,13 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
         if (skin_) {
             if (pressed_skin_element_ == L"volume" || pressed_skin_element_ == L"progress")
                 SetSliderStatus({});
-            pressed_skin_element_.clear();
+            const auto cancelled = std::exchange(pressed_skin_element_, {});
+            const bool button_capture = !captured_skin_button_.empty();
             EndSkinMouseCapture();
-            InvalidateRect(window_, nullptr, FALSE);
+            // WM_CAPTURECHANGED already invalidates a button if its stored
+            // state changes. An unchanged checked frame must stay covered by
+            // the last independently painted visual/info frame.
+            if (!button_capture) InvalidateSkinElement(cancelled);
             return 0;
         }
         break;
@@ -3633,6 +3732,8 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
                 else RefreshPlaybackUi();
                 return 0;
             }
+            PollNetworkPlayback();
+            PollNetworkDownloads();
             const auto state = audio_->State();
             if (playback_was_active_ && state == audio::PlaybackState::stopped) {
                 playback_was_active_ = false;
@@ -4106,7 +4207,203 @@ void PlayerWindow::Paint(HDC dc) const {
              static_cast<int>(playlist_label.size()));
 }
 
-void PlayerWindow::PaintSkin(HDC dc) const {
+std::wstring_view PlayerWindow::ActiveMainSkinButton(std::wstring_view name) const {
+    if (name != L"play" && name != L"pause") return name;
+    const auto playback = audio_->State();
+    return playback == audio::PlaybackState::opening || playback == audio::PlaybackState::playing
+        ? L"pause" : L"play";
+}
+
+skin::SkinButtonState& PlayerWindow::MainSkinButton(std::wstring_view name) const {
+    name = ActiveMainSkinButton(name);
+    // 0040A1DD replaces the bitmap/region on the same 0x7D00 HWND. Its
+    // pressed/hover/capture state survives a play/pause image change.
+    auto& state = main_skin_buttons_[std::wstring(name == L"pause" ? L"play" : name)];
+    const bool enabled = IsSkinElementEnabled(name);
+    // EnableWindow(FALSE) cancels capture before delivering WM_ENABLE. Keep
+    // the disabled frame after cancellation and stop routing moves to it.
+    if (state.enabled && !enabled && GetCapture() == window_ &&
+        ActiveMainSkinButton(captured_skin_button_) == name) ReleaseCapture();
+    state.Sync(enabled, IsSkinElementChecked(name));
+    return state;
+}
+
+bool PlayerWindow::MainSkinButtonContains(std::wstring_view name, POINT point) const {
+    name = ActiveMainSkinButton(name);
+    const auto* element = FindActiveSkinElement(name);
+    if (!element || !skin_) return false;
+    const RECT bounds = MainSkinButtonBounds(name);
+    if (!PtInRect(&bounds, point)) return false;
+    const HRGN region = element->image.CreateRegion(skin_->TransparentColor(), 4);
+    const bool inside = !region || PtInRegion(region, point.x - bounds.left, point.y - bounds.top);
+    if (region) DeleteObject(region);
+    return inside;
+}
+
+RECT PlayerWindow::MainSkinButtonBounds(std::wstring_view name) const {
+    const auto* element = FindActiveSkinElement(name);
+    if (name != L"play" && name != L"pause") return element ? element->bounds : RECT{};
+    const auto* play = FindActiveSkinElement(L"play");
+    if (!play) return {};
+    if (play_button_layout_ != play) {
+        play_button_layout_ = play;
+        play_button_bounds_ = play->bounds;
+        play_button_image_.clear();
+    }
+    name = ActiveMainSkinButton(name);
+    if (play_button_image_ != name) {
+        element = FindActiveSkinElement(name);
+        // 0040A1DD clears the region for a null bitmap, retaining the child
+        // rectangle. A valid bitmap, including a zero-width frame, resizes it.
+        if (element && element->image) {
+            play_button_bounds_.right = play_button_bounds_.left + element->image_size.cx / 4;
+            play_button_bounds_.bottom = play_button_bounds_.top + element->image_size.cy;
+        }
+        play_button_image_ = name;
+    }
+    return play_button_bounds_;
+}
+
+void PlayerWindow::InvalidateSkinElement(std::wstring_view name) {
+    if (!window_ || name.empty()) return;
+    name = ActiveMainSkinButton(name);
+    const auto* element = FindActiveSkinElement(name);
+    if (!element) return;
+    // SkinButton::OnPaint (0040A35B) validates a null bitmap without drawing
+    // anything. A state-only invalidation must not erase its retained pixels.
+    if (element->four_state && !element->image) return;
+    if (std::find(dirty_skin_elements_.begin(), dirty_skin_elements_.end(), name) == dirty_skin_elements_.end())
+        dirty_skin_elements_.emplace_back(name);
+    RECT bounds = MainSkinButtonBounds(name);
+    if (name == L"volume" || name == L"progress") {
+        const RECT next = SkinSliderThumbRegion(*element);
+        // 00428F41 invalidates the union of the old/new thumb strips, not
+        // the entire track. This matters when an independently painted
+        // button covers the one-pixel slider inset.
+        auto& previous = skin_slider_thumbs_[element->name];
+        UnionRect(&bounds, &previous, &next);
+        previous = next;
+    }
+    const HRGN region = element->four_state
+        ? element->image.CreateRegion(skin_->TransparentColor(), 4) : nullptr;
+    if (region) {
+        OffsetRgn(region, bounds.left, bounds.top);
+        // This damage belongs to a virtual skin child. Do not invalidate the
+        // real VisualCtrl beneath it: its later WM_PAINT would erase the new
+        // button frame, unlike invalidating the original SkinButton HWND.
+        RedrawWindow(window_, nullptr, region, RDW_INVALIDATE | RDW_NOCHILDREN);
+        DeleteObject(region);
+    } else RedrawWindow(window_, &bounds, nullptr, RDW_INVALIDATE | RDW_NOCHILDREN);
+}
+
+RECT PlayerWindow::SkinSliderThumbRegion(const skin::SkinElement& element) const {
+    const auto geometry = MainSliderGeometry(element);
+    const int value = element.name == L"volume" ? std::clamp(settings_.player.volume, 0, 100) :
+        static_cast<int>(std::clamp<int64_t>(progress_tracking_position_.value_or(audio_->Position()).count(), 0, geometry.maximum));
+    return geometry.Thumb(value);
+}
+
+skin::SkinSliderGeometry PlayerWindow::MainSliderGeometry(const skin::SkinElement& element) const {
+    return {element.bounds, 0, element.name == L"volume" ? 100 : static_cast<int>(
+        std::clamp<int64_t>(audio_->Duration().count(), 1, INT_MAX)),
+        element.thumb_image ? static_cast<int>(element.vertical ? element.thumb_size.cy : element.thumb_size.cx / 4) : 1,
+        element.vertical};
+}
+
+void PlayerWindow::ApplyMainSkinSliderEvent(const std::wstring& name, const skin::SkinSliderEvent& event) {
+    if (event.notification >= 0) {
+        const int value = main_skin_sliders_.at(name).value;
+        if (name == L"volume") {
+            SetPlaybackVolume(value);
+            // A rail DOWN commits immediately but is still being held.
+            // Display feedback for its actual drag state, not the scroll code.
+            SetVolumeTrackingStatus(main_skin_sliders_.at(name).dragging);
+        } else {
+            if (event.notification == SB_THUMBPOSITION) {
+                // Mouse input previews until UP; keyboard position commands
+                // also arrive here as a single committed value.
+                audio_->SeekWithoutFade(std::chrono::milliseconds(value));
+                UpdateDiscordPresence();
+            }
+            if (main_skin_sliders_.at(name).dragging)
+                progress_tracking_position_ = std::chrono::milliseconds(value);
+            else progress_tracking_position_.reset();
+            InvalidateSkinElement(L"led");
+        }
+    }
+    if (event.redraw) InvalidateSkinElement(name);
+}
+
+bool PlayerWindow::HandleMainSkinSliderMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+    if (!skin_ || !captured_skin_button_.empty() || dragging_skin_background_) return false;
+    const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+    std::wstring name = captured_skin_slider_;
+    if (message == WM_KEYDOWN) name = focused_skin_slider_;
+    else if (name.empty()) {
+        if (message == WM_LBUTTONUP) return false;
+        name = HitTestSkin(point);
+    }
+    if (name != L"volume" && name != L"progress") return false;
+    const auto* element = FindActiveSkinElement(name);
+    if (!element || !IsSkinElementEnabled(name)) {
+        if (captured_skin_slider_ == name) EndSkinMouseCapture();
+        return false;
+    }
+    const auto geometry = MainSliderGeometry(*element);
+    auto state = main_skin_sliders_[name];
+    const int current = name == L"volume" ? settings_.player.volume : static_cast<int>(
+        std::clamp<int64_t>(audio_->Position().count(), 0, geometry.maximum));
+    state.Sync(geometry, current);
+    const bool had_capture = captured_skin_slider_ == name;
+    skin::SkinSliderEvent event;
+    if (message == WM_LBUTTONDOWN) {
+        last_skin_mouse_down_target_ = name;
+        focused_skin_slider_ = name;
+        SetFocus(window_);
+        event = state.Down(geometry, point);
+        if (name == L"progress" && event.notification == SB_THUMBPOSITION) {
+            // Seek only on release, including a rail click without MOVE.
+            // Other sliders keep their immediate rail-click adjustment.
+            state.commit_pending = true;
+            event.notification = SB_THUMBTRACK;
+        }
+        // Hold the pressed position on screen while the mouse is down.
+        if (name == L"progress" && state.dragging)
+            progress_tracking_position_ = std::chrono::milliseconds(state.value);
+    } else if (message == WM_MOUSEMOVE) {
+        event = state.Move(geometry, point);
+    } else if (message == WM_LBUTTONUP) {
+        event = state.Up(geometry, point);
+    } else if (message == WM_KEYDOWN) {
+        event = state.Key(geometry, static_cast<UINT>(wparam));
+        if (event.notification < 0) return false;
+    } else return false;
+    if (state.captured) {
+        if (GetCapture() != window_) SetCapture(window_);
+        captured_skin_slider_ = name;
+    } else if (had_capture) {
+        captured_skin_slider_.clear();
+        if (GetCapture() == window_) ReleaseCapture();
+    }
+    main_skin_sliders_[name] = state;
+    pressed_skin_element_ = state.dragging ? name : L"";
+    hover_skin_element_ = state.captured ? name : L"";
+    ApplyMainSkinSliderEvent(name, event);
+    if (name == L"volume" && event.notification < 0 &&
+        (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)) {
+        // A thumb press has no value notification; an unmoved rail release
+        // has no second commit. Both still change the feedback lifecycle.
+        SetVolumeTrackingStatus(state.dragging);
+    }
+    if (name == L"progress" && message == WM_LBUTTONUP && !state.dragging) {
+        // End the preview even if cancellation left no seek notification.
+        progress_tracking_position_.reset();
+        InvalidateSkinElement(L"led");
+    }
+    return true;
+}
+
+void PlayerWindow::PaintSkin(HDC dc, const std::vector<std::wstring>* repaint) const {
     if (!skin_) return;
     const SIZE size = ActiveSkinSize();
     const HDC canvas = CreateCompatibleDC(dc);
@@ -4120,7 +4417,11 @@ void PlayerWindow::PaintSkin(HDC dc) const {
     const bool active = playback == audio::PlaybackState::opening ||
                         playback == audio::PlaybackState::playing;
     const skin::SkinLayers layers(PlayerSkinLayers(ActiveSkinElements(), active,
-        settings_.player.play_mode, CurrentLedText()), skin_->TransparentColor());
+        settings_.player.play_mode, CurrentLedText(), CurrentSkinIcon(), MainSkinButtonBounds(L"play")), skin_->TransparentColor(), repaint);
+    for (const auto* name : {L"volume", L"progress"})
+        if ((!repaint || std::find(repaint->begin(), repaint->end(), name) != repaint->end()))
+            if (const auto* element = FindActiveSkinElement(name))
+                skin_slider_thumbs_[name] = SkinSliderThumbRegion(*element);
     for (const auto& element : ActiveSkinElements()) {
         const skin::SkinLayerClip clip(canvas, layers, &element);
         if (!element.image || !element.four_state) continue;
@@ -4129,26 +4430,14 @@ void PlayerWindow::PaintSkin(HDC dc) const {
         if (element.name == L"play" && active) continue;
         if (element.name == L"pause" && !active) continue;
         skin::SkinElement displayed = element;
-        if (element.name == L"pause") {
-            // The player owns one play/pause HWND (command 0x7d00).  The
-            // pause bitmap replaces the play bitmap on that same HWND, so a
-            // distinct <pause position> is not used by 5.7.9.
-            if (const auto* play = FindActiveSkinElement(L"play")) {
-                const int width = element.image_size.cx / 4;
-                displayed.bounds = {play->bounds.left, play->bounds.top,
-                    play->bounds.left + width,
-                    play->bounds.top + element.image_size.cy};
-            }
-        }
+        if (element.name == L"play" || element.name == L"pause")
+            displayed.bounds = MainSkinButtonBounds(element.name);
         // FUN_0045A04E asks the three auxiliary HWNDs for their real visible
         // state and feeds that state to SkinButton through FUN_004455D6.
         // SkinButton::OnPaint (FUN_0040A35B) uses frame 2 while checked,
         // except that a live hover continues to use frame 1. Treat mute the
         // same way: it is another persistent SkinButton check state.
-        int state = IsSkinElementEnabled(element.name)
-            ? (IsSkinElementChecked(element.name) ? 2 : 0) : 3;
-        if (state != 3 && pressed_skin_element_ == element.name) state = 2;
-        else if (state != 3 && hover_skin_element_ == element.name) state = 1;
+        const int state = MainSkinButton(element.name).Frame();
         DrawSkinElement(canvas, displayed, state);
     }
 
@@ -4164,41 +4453,34 @@ void PlayerWindow::PaintSkin(HDC dc) const {
             std::clamp<int64_t>(duration, 1, INT_MAX));
         const int safe_position = static_cast<int>(
             std::clamp<int64_t>(position, 0, safe_duration));
-        const int width = std::max(1L, progress->thumb_size.cx / 4);
-        const int height = std::max(1L, progress->thumb_size.cy);
-        // FUN_00451CEF initializes the shared legacy slider edge inset to one
-        // pixel; FUN_00428F41 excludes it at both value-range endpoints.
-        constexpr int slider_inset = 1;
-        const int horizontal_span = std::max(
-            0, control_width - slider_inset * 2 - width);
-        const int vertical_span = std::max(
-            0, control_height - slider_inset * 2 - height);
-        const int logical_thumb_left = progress->bounds.left + slider_inset +
-            (duration > 0 ? MulDiv(safe_position, horizontal_span,
-                                   safe_duration) : 0);
-        const int logical_thumb_top = progress->bounds.top + slider_inset +
-            (duration > 0 ? MulDiv(safe_duration - safe_position,
-                                   vertical_span, safe_duration)
-                          : vertical_span);
+        const int width = std::max(0L, progress->thumb_size.cx / 4);
+        const int height = std::max(0L, progress->thumb_size.cy);
+        const int logical_width = progress->thumb_image ? width : 1;
+        const int logical_height = progress->thumb_image ? height : 1;
+        const RECT strip = SkinSliderThumbRegion(*progress);
+        const int logical_thumb_left = strip.left;
+        const int logical_thumb_top = strip.top;
         if (progress->bar_image && progress->bar_size.cx > 0 && progress->bar_size.cy > 0) {
             const int x = progress->bounds.left + (control_width - progress->bar_size.cx) / 2;
             const int y = progress->bounds.top + (control_height - progress->bar_size.cy) / 2;
             progress->bar_image.Draw(canvas, x, y, progress->bar_size.cx,
                 progress->bar_size.cy, 0, 0, progress->bar_size.cx, progress->bar_size.cy);
         }
-        const auto draw_fill = [&](const skin::SkinImage& image, SIZE fill_size, int value, int maximum) {
+        const auto draw_fill = [&](const skin::SkinImage& image, SIZE fill_size, int value, int maximum, bool downloaded) {
             if (!image || fill_size.cx <= 0 || fill_size.cy <= 0 || maximum <= 0) return;
             const int fill_left = progress->bounds.left + (control_width - fill_size.cx) / 2;
             const int fill_top = progress->bounds.top + (control_height - fill_size.cy) / 2;
             if (progress->vertical) {
-                const int edge = progress->bounds.top + slider_inset +
-                    MulDiv(maximum - value, vertical_span, maximum) + height / 2;
+                const int edge = downloaded
+                    ? fill_top + MulDiv(maximum - value, fill_size.cy, maximum)
+                    : logical_thumb_top + logical_height / 2;
                 const int sy = std::clamp(edge - fill_top, 0, static_cast<int>(fill_size.cy));
                 image.Draw(canvas, fill_left, fill_top + sy, fill_size.cx, fill_size.cy - sy,
                     0, sy, fill_size.cx, fill_size.cy - sy, skin_->TransparentColor());
             } else {
-                const int edge = progress->bounds.left + slider_inset +
-                    MulDiv(value, horizontal_span, maximum) + width / 2;
+                const int edge = downloaded
+                    ? fill_left + MulDiv(value, fill_size.cx, maximum)
+                    : logical_thumb_left + logical_width / 2;
                 const int filled = std::clamp(edge - fill_left, 0, static_cast<int>(fill_size.cx));
                 image.Draw(canvas, fill_left, fill_top, filled, fill_size.cy,
                     0, 0, filled, fill_size.cy, skin_->TransparentColor());
@@ -4206,13 +4488,13 @@ void PlayerWindow::PaintSkin(HDC dc) const {
         };
         // 0045287B: background, downloaded layer, played layer, thumb.
         const int downloaded = audio_->DownloadedPercent();
-        if (downloaded > 0) draw_fill(progress->fill_image2, progress->fill_size2, downloaded, 100);
-        if (duration > 0) draw_fill(progress->fill_image, progress->fill_size, safe_position, safe_duration);
+        if (downloaded > 0) draw_fill(progress->fill_image2, progress->fill_size2, downloaded, 100, true);
+        if (duration > 0) draw_fill(progress->fill_image, progress->fill_size, safe_position, safe_duration, false);
         skin::SkinElement thumb = *progress;
         thumb.image = progress->thumb_image;
         thumb.image_size = progress->thumb_size;
         thumb.frames = 4;
-        thumb.four_state = true;
+        thumb.four_state = false;
         thumb.bounds.left = progress->vertical
             ? progress->bounds.left + (control_width - width) / 2
             : logical_thumb_left;
@@ -4233,23 +4515,14 @@ void PlayerWindow::PaintSkin(HDC dc) const {
         const skin::SkinLayerClip clip(canvas, layers, volume);
         const int control_width = volume->bounds.right - volume->bounds.left;
         const int control_height = volume->bounds.bottom - volume->bounds.top;
-        const int value = std::clamp(settings_.player.volume, 0, 100);
         const int thumb_width = volume->thumb_image && volume->thumb_size.cx > 0
             ? volume->thumb_size.cx / 4 : 0;
         const int thumb_height = volume->thumb_image ? volume->thumb_size.cy : 0;
-        // FUN_00451CEF initializes the slider's edge inset to one pixel, and
-        // FUN_00428F41 uses that inset on both ends of the value range.
-        constexpr int slider_inset = 1;
-        const int horizontal_thumb_extent = std::max(1, thumb_width);
-        const int vertical_thumb_extent = std::max(1, thumb_height);
-        const int horizontal_span = std::max(
-            0, control_width - slider_inset * 2 - horizontal_thumb_extent);
-        const int vertical_span = std::max(
-            0, control_height - slider_inset * 2 - vertical_thumb_extent);
-        const int logical_thumb_left = volume->bounds.left + slider_inset +
-            MulDiv(horizontal_span, value, 100);
-        const int logical_thumb_top = volume->bounds.top + slider_inset +
-            MulDiv(vertical_span, 100 - value, 100);
+        const int horizontal_thumb_extent = volume->thumb_image ? thumb_width : 1;
+        const int vertical_thumb_extent = volume->thumb_image ? thumb_height : 1;
+        const RECT strip = SkinSliderThumbRegion(*volume);
+        const int logical_thumb_left = strip.left;
+        const int logical_thumb_top = strip.top;
         // FUN_00451E07 paints the slider background before the filled portion.
         // Volume used to skip this layer entirely, leaving only fill + thumb.
         if (volume->bar_image && volume->bar_size.cx > 0 && volume->bar_size.cy > 0) {
@@ -4304,12 +4577,12 @@ void PlayerWindow::PaintSkin(HDC dc) const {
             }
             if (saved_dc != 0) RestoreDC(canvas, saved_dc);
         }
-        if (volume->thumb_image && thumb_width > 0 && thumb_height > 0) {
+        if (volume->thumb_image && thumb_height > 0) {
             skin::SkinElement thumb = *volume;
             thumb.image = volume->thumb_image;
             thumb.image_size = volume->thumb_size;
             thumb.frames = 4;
-            thumb.four_state = true;
+            thumb.four_state = false;
             const int x = volume->vertical
                 ? volume->bounds.left + (control_width - thumb_width) / 2
                 : logical_thumb_left;
@@ -4319,7 +4592,8 @@ void PlayerWindow::PaintSkin(HDC dc) const {
             thumb.bounds = {x, y, x + thumb_width, y + thumb_height};
             const int state = pressed_skin_element_ == L"volume" ? 2 :
                 (hover_skin_element_ == L"volume" ? 1 : 0);
-            DrawSkinElement(canvas, thumb, state);
+            thumb.animation = {};
+            DrawSkinSliderThumb(canvas, thumb, state, false, volume->bounds);
         }
     }
 
@@ -4343,13 +4617,11 @@ void PlayerWindow::PaintSkin(HDC dc) const {
         DrawSkinLed(canvas, *led, CurrentLedText(), skin_->TransparentColor());
     }
 
-    const HICON skin_icon = settings_.general.app_icon_file.empty() &&
-                                    skin_->Icon()
-        ? skin_->Icon() : window_icon_small_;
+    const HICON skin_icon = CurrentSkinIcon();
     if (skin_icon) {
         if (const auto* icon = FindActiveSkinElement(L"icon")) {
             const skin::SkinLayerClip clip(canvas, layers, icon);
-            DrawSkinIcon(canvas, skin_icon, icon->bounds);
+            DrawSkinIcon(canvas, skin_icon, skin::NativeSkinIconBounds(skin_icon, icon->bounds));
         }
     }
 
@@ -4360,20 +4632,15 @@ void PlayerWindow::PaintSkin(HDC dc) const {
     // child-window z-order of the original skin host by excluding the live
     // embedded visual from the parent's final screen transfer.
     const int saved_output = SaveDC(dc);
+    if (repaint) layers.ClipRepaint(dc);
     if (visual_window_ && !fullscreen_visual_detached_ &&
         GetParent(visual_window_) == window_ &&
         IsWindowVisible(visual_window_)) {
         if (const auto* visual = FindActiveSkinElement(L"visual")) {
             const HRGN region = layers.Region(visual);
-            // A play/pause sprite can change its shaped region without a
-            // layout change. Keep the real visual child below the same mask.
-            const HRGN child_region = layers.Region(visual);
-            OffsetRgn(child_region, -visual->bounds.left, -visual->bounds.top);
-            const HRGN previous = CreateRectRgn(0, 0, 0, 0);
-            if (GetWindowRgn(visual_window_, previous) == ERROR || !EqualRgn(previous, child_region)) {
-                if (!SetWindowRgn(visual_window_, child_region, TRUE)) DeleteObject(child_region);
-            } else DeleteObject(child_region);
-            DeleteObject(previous);
+            // Child hit regions determine which parent controls may repaint
+            // here. They must not become the visual child's window region:
+            // its independent frame drawing has no sibling clipping.
             ExtSelectClipRgn(dc, region, RGN_DIFF);
             DeleteObject(region);
         }
@@ -4487,6 +4754,14 @@ SIZE PlayerWindow::ActiveSkinSize() const noexcept {
         ? skin_->MiniWindowSize() : skin_->WindowSize();
 }
 
+HICON PlayerWindow::CurrentSkinIcon() const noexcept {
+    // 004710FD first binds the active layout. The later 0045C937 refresh
+    // calls 00415FB0 with the MAIN application's small icon, including on
+    // mini transitions. That call also restores its native client size.
+    const HICON icon = skin_ && settings_.general.app_icon_file.empty() ? skin_->Icon() : nullptr;
+    return icon ? icon : window_icon_small_;
+}
+
 const std::vector<skin::SkinElement>& PlayerWindow::ActiveSkinElements() const noexcept {
     static const std::vector<skin::SkinElement> empty;
     if (!skin_) return empty;
@@ -4502,8 +4777,11 @@ const skin::SkinElement* PlayerWindow::FindActiveSkinElement(std::wstring_view n
 
 std::wstring PlayerWindow::CurrentLedText() const {
     const auto position = progress_tracking_position_.value_or(audio_->Position());
-    return FormatLedTime(settings_.player.show_elapsed_time
-        ? position : position - audio_->Duration());
+    if (settings_.player.show_elapsed_time) return FormatLedTime(position);
+    // 0045CE05 clamps remaining time to zero; LED flag 8 still draws '-'.
+    // Computing a signed difference loses that sign at zero / after EOF.
+    return L"-" + FormatLedTime(std::max(std::chrono::milliseconds::zero(),
+                                        audio_->Duration() - position));
 }
 
 std::wstring PlayerWindow::HitTestSkin(POINT point) const {
@@ -4512,7 +4790,7 @@ std::wstring PlayerWindow::HitTestSkin(POINT point) const {
     const bool active = playback == audio::PlaybackState::opening ||
                         playback == audio::PlaybackState::playing;
     const skin::SkinLayers layers(PlayerSkinLayers(ActiveSkinElements(), active,
-        settings_.player.play_mode, CurrentLedText()), skin_->TransparentColor());
+        settings_.player.play_mode, CurrentLedText(), CurrentSkinIcon(), MainSkinButtonBounds(L"play")), skin_->TransparentColor());
     if (const auto* layer = layers.Hit(point)) {
         const auto& name = layer->element->name;
         // Disabled and non-command children still occlude lower controls.
@@ -4540,7 +4818,8 @@ void PlayerWindow::InvokeSkinAction(std::wstring_view action) {
         // it is therefore another physical entry to the 0xE140 Options item,
         // not a caption-drag surface.
         if (const auto* icon = FindActiveSkinElement(L"icon")) {
-            POINT anchor{icon->bounds.left, icon->bounds.bottom};
+            const RECT bounds = skin::NativeSkinIconBounds(CurrentSkinIcon(), icon->bounds);
+            POINT anchor{bounds.left, bounds.bottom};
             ClientToScreen(window_, &anchor);
             ShowContextMenu(anchor);
         }
@@ -4578,7 +4857,10 @@ void PlayerWindow::InvokeSkinAction(std::wstring_view action) {
         SendMessageW(window_, WM_COMMAND, kCmdShowElapsedTime, 0);
     }
     RefreshPlaybackUi();
-    InvalidateRect(window_, nullptr, FALSE);
+    // Playback commands update their native children independently. Repainting
+    // the parent here would erase retained pixels of a missing play bitmap.
+    if (!skin_ || external_skin_ || (action != L"play" && action != L"pause" && action != L"stop" && action != L"mute"))
+        InvalidateRect(window_, nullptr, FALSE);
 }
 
 std::vector<HWND> PlayerWindow::RegisteredDragWindows() const {
@@ -4865,7 +5147,10 @@ void PlayerWindow::ContinueSkinBackgroundDrag(HWND source, POINT point) {
 }
 
 void PlayerWindow::EndSkinMouseCapture() {
+    if (pressed_skin_element_ == L"volume") SetVolumeTrackingStatus(false);
     progress_tracking_position_.reset();
+    for (auto& [name, state] : main_skin_sliders_) state.Cancel();
+    captured_skin_slider_.clear();
     HWND captured = skin_drag_window_;
     if (!captured) {
         const HWND current = GetCapture();
@@ -4962,6 +5247,7 @@ void PlayerWindow::ToggleMiniMode() {
         ShowWindow(playlist_window_, SW_HIDE);
     if (next_mini && equalizer_window_ && IsWindowVisible(equalizer_window_))
         ShowWindow(equalizer_window_, SW_HIDE);
+    const auto* previous_info = FindActiveSkinElement(L"info");
     mini_mode_ = next_mini;
     settings_.player.mini_mode = mini_mode_;
     const LONG_PTR desired_extended =
@@ -4975,7 +5261,14 @@ void PlayerWindow::ToggleMiniMode() {
     UpdateMainToolRects();
     UpdateVisualWindowLayout();
     UpdateVisualFrame();
-    ResetSkinInfoScroll();
+    const auto* next_info = FindActiveSkinElement(L"info");
+    // 00464B6C rebinds the same MultiLabel HWND. Its WM_SIZE (004097B6)
+    // restarts the sequence only for a changed client size. A move or an
+    // identical normal/mini layout retains the current item and offsets.
+    if (info_timer_ && (!previous_info || !next_info ||
+        previous_info->bounds.right - previous_info->bounds.left != next_info->bounds.right - next_info->bounds.left ||
+        previous_info->bounds.bottom - previous_info->bounds.top != next_info->bounds.bottom - next_info->bounds.top))
+        ResetSkinInfoScroll();
     suppress_skin_window_activation_fade_ = true;
     ShowWindow(window_, SW_SHOW);
     if (lyric_window_) {
@@ -5529,7 +5822,7 @@ void PlayerWindow::QueueSkinMenuToolTip(UINT command, HMENU menu) {
         SetWindowPos(skin_menu_tooltip_, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         SendMessageW(skin_menu_tooltip_, TTM_SETMAXTIPWIDTH, 0, 600);
-        TOOLINFOW tool{sizeof(tool)};
+        TOOLINFOW tool{TTTOOLINFOW_V2_SIZE};
         tool.uFlags = TTF_TRACK | TTF_ABSOLUTE;
         tool.hwnd = window_;
         tool.uId = 1;
@@ -5543,7 +5836,7 @@ void PlayerWindow::QueueSkinMenuToolTip(UINT command, HMENU menu) {
     }
 
     KillTimer(window_, kSkinMenuToolTipTimer);
-    TOOLINFOW tool{sizeof(tool)};
+    TOOLINFOW tool{TTTOOLINFOW_V2_SIZE};
     tool.uFlags = TTF_TRACK | TTF_ABSOLUTE;
     tool.hwnd = window_;
     tool.uId = 1;
@@ -5589,7 +5882,7 @@ void PlayerWindow::ShowQueuedSkinMenuToolTip() {
         return;
     }
 
-    TOOLINFOW tool{sizeof(tool)};
+    TOOLINFOW tool{TTTOOLINFOW_V2_SIZE};
     tool.uFlags = TTF_TRACK | TTF_ABSOLUTE;
     tool.hwnd = window_;
     tool.uId = 1;
@@ -5605,7 +5898,7 @@ void PlayerWindow::ShowQueuedSkinMenuToolTip() {
 void PlayerWindow::HideSkinMenuToolTip() {
     if (window_) KillTimer(window_, kSkinMenuToolTipTimer);
     if (skin_menu_tooltip_ && IsWindow(skin_menu_tooltip_)) {
-        TOOLINFOW tool{sizeof(tool)};
+        TOOLINFOW tool{TTTOOLINFOW_V2_SIZE};
         tool.uFlags = TTF_TRACK | TTF_ABSOLUTE;
         tool.hwnd = window_;
         tool.uId = 1;
@@ -5986,7 +6279,8 @@ bool PlayerWindow::HandleContextCommand(UINT command, HWND fullscreen_origin) {
     default: return false;
     }
     RefreshPlaybackUi();
-    InvalidateRect(window_, nullptr, FALSE);
+    if (!skin_ || external_skin_ || (command != kCmdPlay && command != kCmdPause && command != kCmdStopPlayback && command != kCmdMute))
+        InvalidateRect(window_, nullptr, FALSE);
     return true;
 }
 
@@ -6052,7 +6346,7 @@ bool PlayerWindow::ApplyLoadedSkin(bool apply_visual_settings, bool saved_bounds
     if (apply_visual_settings) ApplySkinVisualSettings();
     ApplyApplicationIcons();
     UpdateLyricWindowSkin(saved_bounds);
-    desktop_lyrics_.SetSkin(&*skin_);
+    desktop_lyrics_.SetSkin(&*skin_, window_icon_small_);
     desktop_lyrics_.ApplySettings();
     UpdatePlaylistWindowSkin(saved_bounds);
     UpdateEqualizerWindowSkin(saved_bounds);
@@ -6255,6 +6549,8 @@ BYTE PlayerWindow::EffectiveSkinWindowAlpha(HWND target) const noexcept {
 
 void PlayerWindow::SetSkinWindowVisible(HWND target, bool visible) {
     if (!target || !IsWindow(target)) return;
+    if (target == lyric_window_ && skin_ && !skin_->Lyric().valid && !mini_mode_)
+        visible = false;
     CompleteSkinWindowFadeForReplacement();
     if (!target || !IsWindow(target) || close_after_skin_window_fade_) return;
     const bool currently_visible = IsWindowVisible(target) != FALSE;
@@ -6514,12 +6810,17 @@ void PlayerWindow::ToggleMute() {
 }
 
 void PlayerWindow::SetPlaybackVolume(int volume) {
+    const int previous = settings_.player.volume;
     settings_.player.volume = std::clamp(volume, 0, 100);
     // 00460AB1 keeps mute independent of changes to the stored volume.
     audio_->SetVolume(settings_.player.mute ? 0.0F :
         static_cast<float>(settings_.player.volume) / 100.0F);
     if (volume_) SendMessageW(volume_, TBM_SETPOS, TRUE, settings_.player.volume);
-    if (window_) InvalidateRect(window_, nullptr, FALSE);
+    if (skin_) {
+        if (previous != settings_.player.volume) InvalidateSkinElement(L"volume");
+        InvalidateSkinElement(L"mute");
+        InvalidateSkinElement(L"stereo");
+    } else if (window_) InvalidateRect(window_, nullptr, FALSE);
 }
 
 void PlayerWindow::AdjustPlaybackVolume(int delta) {
@@ -6527,7 +6828,7 @@ void PlayerWindow::AdjustPlaybackVolume(int delta) {
     // tracking. 00460AB1 then reads the unchanged slider back into settings.
     const HWND captured = GetCapture();
     const bool tracking = (window_ && captured == window_ &&
-                           pressed_skin_element_ == L"volume") ||
+                           main_skin_sliders_[L"volume"].dragging) ||
                           (volume_ && captured == volume_) ||
                           (external_skin_ && external_skin_->VolumeTracking());
     if (!tracking) SetPlaybackVolume(settings_.player.volume + delta);
@@ -6562,7 +6863,7 @@ void PlayerWindow::SetSliderStatus(std::wstring text) {
     if (status_) SetWindowTextW(status_, displayed.c_str());
     if (window_) {
         if (const auto* status = FindActiveSkinElement(L"status"))
-            InvalidateRect(window_, &status->bounds, FALSE);
+            InvalidateSkinElement(L"status");
     }
 }
 
@@ -6576,60 +6877,20 @@ void PlayerWindow::ShowVolumeInput() {
 
 void PlayerWindow::SetSkinVolumeFromPoint(POINT point) {
     if (!skin_) return;
-    const auto* volume = FindActiveSkinElement(L"volume");
-    if (!volume) return;
+    const auto* element = FindActiveSkinElement(L"volume");
+    if (!element) return;
     const int before = settings_.player.volume;
-    if (volume->vertical) {
-        const int height = volume->bounds.bottom - volume->bounds.top;
-        const int thumb = volume->thumb_image ? volume->thumb_size.cy : 0;
-        const int span = height - 2 - thumb;
-        if (span <= 0) return;
-        const int position = volume->bounds.bottom - 1 - thumb / 2 - point.y;
-        settings_.player.volume = std::clamp(MulDiv(position, 100, span), 0, 100);
-    } else {
-        const int width = volume->bounds.right - volume->bounds.left;
-        const int thumb = volume->thumb_image ? volume->thumb_size.cx / 4 : 0;
-        const int span = width - 2 - thumb;
-        if (span <= 0) return;
-        const int position = point.x - volume->bounds.left - 1 - thumb / 2;
-        settings_.player.volume = std::clamp(MulDiv(position, 100, span), 0, 100);
-    }
-    SetPlaybackVolume(settings_.player.volume);
-    // SkinSlider sends SB_THUMBTRACK only when the value actually changes.
+    SetPlaybackVolume(MainSliderGeometry(*element).ValueAt(point));
     if (settings_.player.volume != before) SetVolumeTrackingStatus(true);
 }
 
 void PlayerWindow::SetSkinProgressFromPoint(POINT point) {
-    if (!skin_) return;
-    const auto* progress = FindActiveSkinElement(L"progress");
-    const auto duration = audio_->Duration();
-    if (!progress || duration.count() <= 0) return;
-    int value{};
-    constexpr int slider_inset = 1;
-    if (progress->vertical) {
-        const int height = progress->bounds.bottom - progress->bounds.top;
-        const int thumb = progress->thumb_image ? progress->thumb_size.cy : 0;
-        const int span = height - slider_inset * 2 - thumb;
-        if (span <= 0) return;
-        const int first_center = progress->bounds.top + slider_inset + thumb / 2;
-        value = span - std::clamp<int>(point.y - first_center, 0, span);
-        progress_tracking_position_ = std::chrono::milliseconds(
-            duration.count() * value / span);
-    } else {
-        const int width = progress->bounds.right - progress->bounds.left;
-        const int thumb = progress->thumb_image ? progress->thumb_size.cx / 4 : 0;
-        const int span = width - slider_inset * 2 - thumb;
-        if (span <= 0) return;
-        const int first_center = progress->bounds.left + slider_inset + thumb / 2;
-        value = std::clamp<int>(point.x - first_center, 0, span);
-        progress_tracking_position_ = std::chrono::milliseconds(
-            duration.count() * value / span);
-    }
-    // 00428DCD ignores timer updates while tracking; 0045CE05 previews the
-    // LED without moving the decoder/lyrics clock until the release seek.
-    InvalidateRect(window_, &progress->bounds, FALSE);
-    if (const auto* led = FindActiveSkinElement(L"led"))
-        InvalidateRect(window_, &led->bounds, FALSE);
+    if (!skin_ || audio_->Duration().count() <= 0) return;
+    const auto* element = FindActiveSkinElement(L"progress");
+    if (!element) return;
+    progress_tracking_position_ = std::chrono::milliseconds(MainSliderGeometry(*element).ValueAt(point));
+    InvalidateSkinElement(L"progress");
+    InvalidateSkinElement(L"led");
 }
 
 void PlayerWindow::DrawButton(const DRAWITEMSTRUCT& item) const {
@@ -6733,7 +6994,60 @@ void PlayerWindow::RefreshPlaybackUi() {
         audio_->State() == audio::PlaybackState::stopped ||
         audio_->State() == audio::PlaybackState::failed)
         UpdateVisualFrame();
-    if (skin_) InvalidateRect(window_, nullptr, FALSE);
+    if (skin_) {
+        const auto changed = [this](const wchar_t* name, std::wstring value) {
+            auto [it, inserted] = skin_display_values_.try_emplace(name, value);
+            if (inserted || it->second != value) {
+                it->second = std::move(value);
+                InvalidateSkinElement(name);
+            }
+        };
+        changed(L"progress", std::to_wstring(position) + L":" + std::to_wstring(duration) +
+            L":" + std::to_wstring(audio_->DownloadedPercent()));
+        const auto download = std::to_wstring(audio_->DownloadedPercent());
+        auto& previous_download = skin_display_values_[L"download"];
+        if (previous_download != download) {
+            previous_download = download;
+            if (const auto* progress = FindActiveSkinElement(L"progress")) {
+                InvalidateSkinElement(L"progress");
+                InvalidateRect(window_, &progress->bounds, FALSE);
+            }
+        }
+        changed(L"led", CurrentLedText());
+        changed(L"status", text);
+        changed(L"stereo", ChannelText());
+        auto& previous_image = skin_display_values_[L"play-pause-image"];
+        const auto current_image = ActiveMainSkinButton(L"play");
+        if (previous_image != current_image) {
+            // 0040A1DD resizes the existing child and replaces its region with
+            // SetWindowRgn(..., FALSE). Only the area outside the new rectangle
+            // exposes parent damage; holes inside it keep the prior pixels
+            // until a parent repaint, just as with the native HWND.
+            if (const auto* play = FindActiveSkinElement(L"play")) {
+                const RECT old_rect = play_button_layout_ ? play_button_bounds_ : play->bounds;
+                const RECT new_rect = MainSkinButtonBounds(current_image);
+                const HRGN exposed = CreateRectRgnIndirect(&old_rect);
+                const HRGN next = CreateRectRgnIndirect(&new_rect);
+                CombineRgn(exposed, exposed, next, RGN_DIFF);
+                InvalidateRgn(window_, exposed, FALSE);
+                DeleteObject(next);
+                DeleteObject(exposed);
+            }
+            previous_image = current_image;
+            UpdateMainToolRects();
+            // The native null-bitmap branch does not invalidate its child.
+            // Existing pixels remain until a later state/parent repaint.
+            if (const auto* image = FindActiveSkinElement(current_image); image && image->image)
+                InvalidateSkinElement(current_image);
+        }
+        for (const auto& element : ActiveSkinElements()) if (element.four_state) {
+            if (ActiveMainSkinButton(element.name) != element.name) continue;
+            auto& button = main_skin_buttons_[element.name == L"pause" ? L"play" : element.name];
+            const auto before = button;
+            MainSkinButton(element.name);
+            if (before != button) InvalidateSkinElement(element.name);
+        }
+    }
 }
 
 void PlayerWindow::UpdateDiscordPresence() {
@@ -6898,6 +7212,7 @@ void PlayerWindow::ResetSkinInfoScroll() {
     KillTimer(window_, kInfoItemTimer);
     KillTimer(window_, kInfoTransitionTimer);
     KillTimer(window_, kInfoScrollTimer);
+    info_timer_ = 0;
     if (info_items_.empty()) info_items_.push_back(display_title_);
     info_item_index_ = 0;
     info_scroll_offset_ = 0;
@@ -6913,6 +7228,7 @@ void PlayerWindow::StartSkinInfoItem() {
     KillTimer(window_, kInfoItemTimer);
     KillTimer(window_, kInfoTransitionTimer);
     KillTimer(window_, kInfoScrollTimer);
+    info_timer_ = 0;
     info_scroll_offset_ = 0;
     info_scroll_maximum_ = 0;
     info_scroll_direction_ = 0;
@@ -6926,16 +7242,14 @@ void PlayerWindow::StartSkinInfoItem() {
     const HDC dc = GetDC(window_);
     if (!dc) return;
     const HFONT font = CreateSkinFont(*info);
-    const HGDIOBJ old_font = font ? SelectObject(dc, font) : nullptr;
+    const HGDIOBJ old_font = SelectObject(dc, font ? font : GetStockObject(SYSTEM_FONT));
     RECT measured{};
     // FUN_0040939C passes exactly 0xC24: DT_CALCRECT, DT_SINGLELINE,
     // DT_NOPREFIX and DT_VCENTER.
     DrawTextW(dc, info_items_[info_item_index_].c_str(), -1, &measured,
               DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
-    if (font) {
-        SelectObject(dc, old_font);
-        DeleteObject(font);
-    }
+    SelectObject(dc, old_font);
+    if (font) DeleteObject(font);
     ReleaseDC(window_, dc);
 
     const int available = info->bounds.right - info->bounds.left;
@@ -6944,26 +7258,28 @@ void PlayerWindow::StartSkinInfoItem() {
     if (info_scroll_maximum_ > 0) {
         info_scroll_direction_ = 1;
         info_scroll_hold_ticks_ = kInfoEndpointHoldTicks;
-        SetTimer(window_, kInfoScrollTimer, kInfoAnimationIntervalMs, nullptr);
+        info_timer_ = SetTimer(window_, kInfoScrollTimer, kInfoAnimationIntervalMs, nullptr);
     } else if (info_items_.size() > 1) {
         const auto interval = DecodePackedRuntimeOption(
             settings_.general.title_slide_interval, 1, 100);
         if (interval.enabled) {
-            SetTimer(window_, kInfoItemTimer,
+            info_timer_ = SetTimer(window_, kInfoItemTimer,
                      static_cast<UINT>(interval.value * 1000), nullptr);
         }
     }
-    InvalidateRect(window_, &info->bounds, FALSE);
+    InvalidateSkinElement(L"info");
 }
 
 void PlayerWindow::AdvanceSkinInfoScroll(UINT_PTR timer) {
     if (!window_ || !skin_ || info_items_.empty() || !playback_error_text_.empty()) {
         if (window_) KillTimer(window_, timer);
+        if (info_timer_ == timer) info_timer_ = 0;
         return;
     }
     const auto* info = FindActiveSkinElement(L"info");
     if (!info) {
         KillTimer(window_, timer);
+        if (info_timer_ == timer) info_timer_ = 0;
         return;
     }
 
@@ -6972,7 +7288,7 @@ void PlayerWindow::AdvanceSkinInfoScroll(UINT_PTR timer) {
         info_scroll_direction_ = 0;
         info_scroll_offset_ = 0;
         info_vertical_offset_ = 0;
-        SetTimer(window_, kInfoTransitionTimer, kInfoAnimationIntervalMs, nullptr);
+        info_timer_ = SetTimer(window_, kInfoTransitionTimer, kInfoAnimationIntervalMs, nullptr);
     } else if (timer == kInfoTransitionTimer) {
         ++info_vertical_offset_;
         const int height = info->bounds.bottom - info->bounds.top;
@@ -6984,6 +7300,10 @@ void PlayerWindow::AdvanceSkinInfoScroll(UINT_PTR timer) {
     } else if (timer == kInfoScrollTimer) {
         if (info_scroll_hold_ticks_ > 0) {
             --info_scroll_hold_ticks_;
+            // 0040989E returns immediately during the 25 endpoint-hold
+            // ticks. Repainting unchanged text here covers a button that
+            // independently drew over this unclipped info child.
+            return;
         } else {
             const int previous_direction = info_scroll_direction_;
             if (info_scroll_direction_ == 1) {
@@ -7002,23 +7322,60 @@ void PlayerWindow::AdvanceSkinInfoScroll(UINT_PTR timer) {
                 if (info_scroll_direction_ == 1 && info_scroll_offset_ == 0) {
                     KillTimer(window_, kInfoScrollTimer);
                     info_vertical_offset_ = 0;
-                    if (info_items_.size() > 1) {
+                    const auto interval = DecodePackedRuntimeOption(
+                        settings_.general.title_slide_interval, 1, 100);
+                    if (info_items_.size() > 1 && interval.enabled) {
                         info_scroll_hold_ticks_ = 0;
-                        const auto interval = DecodePackedRuntimeOption(
-                            settings_.general.title_slide_interval, 1, 100);
-                        if (interval.enabled) {
-                            SetTimer(window_, kInfoItemTimer,
-                                static_cast<UINT>(interval.value * 1000), nullptr);
-                        }
+                        info_timer_ = SetTimer(window_, kInfoItemTimer,
+                            static_cast<UINT>(interval.value * 1000), nullptr);
                     } else {
-                        SetTimer(window_, kInfoScrollTimer,
-                                 kInfoAnimationIntervalMs, nullptr);
+                        info_scroll_hold_ticks_ = kInfoEndpointHoldTicks;
+                        info_timer_ = SetTimer(window_, kInfoScrollTimer,
+                            kInfoAnimationIntervalMs, nullptr);
                     }
                 }
             }
         }
     }
-    InvalidateRect(window_, &info->bounds, FALSE);
+    PaintSkinInfoTick();
+}
+
+void PlayerWindow::PaintSkinInfoTick() {
+    const auto* info = FindActiveSkinElement(L"info");
+    if (!window_ || !info || info_items_.empty() || info_item_index_ >= info_items_.size()) return;
+    const HDC dc = GetDC(window_);
+    if (!dc) return;
+    const HFONT font = CreateSkinFont(*info);
+    const HGDIOBJ old_font = SelectObject(dc, font ? font : GetStockObject(SYSTEM_FONT));
+    int width = 0;
+    const auto measure = [&](size_t index) {
+        RECT measured{};
+        DrawTextW(dc, info_items_[index].c_str(), -1, &measured,
+                  DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+        width = std::max(width, static_cast<int>(measured.right - measured.left));
+    };
+    // 0040989E measures current, previous (only when index > 0), and next
+    // (wrapping). The blank part of this unclipped child must stay untouched.
+    measure(info_item_index_);
+    if (info_item_index_ > 0) measure(info_item_index_ - 1);
+    measure((info_item_index_ + 1) % info_items_.size());
+    SelectObject(dc, old_font);
+    if (font) DeleteObject(font);
+    RECT bounds = info->bounds;
+    if ((info->alignment & 0x0fU) == 3)
+        bounds.left = std::max(bounds.left, bounds.right - info_scroll_offset_ - width);
+    else
+        bounds.right = std::min(bounds.right, bounds.left + width - info_scroll_offset_);
+    // 00409630 paints with GetDC inside the timer handler. Do not merge this
+    // with pending button WM_PAINT: those children repaint after this event.
+    const int saved = SaveDC(dc);
+    if (saved) {
+        IntersectClipRect(dc, bounds.left, bounds.top, bounds.right, bounds.bottom);
+        const std::vector<std::wstring> repaint{L"info"};
+        PaintSkin(dc, &repaint);
+        RestoreDC(dc, saved);
+    }
+    ReleaseDC(window_, dc);
 }
 
 void PlayerWindow::PollFadingAudio(bool cancel) {
@@ -7089,6 +7446,7 @@ bool PlayerWindow::PlayCurrent() {
     media_library_startup_pending_ = false;
     // Both explicit and automatic requests use the same nonmodal notice.
     ClearAudioError();
+    network_open_pending_ = false;
     pending_natural_play_ = false;
     pending_failed_advance_ = false;
     if (!media_library_playback_active_) {
@@ -7145,6 +7503,7 @@ bool PlayerWindow::PlayCurrent() {
         RefreshPlaybackUi();
         return true;
     }
+    ConfigureNetworkDownloads();
     if (!audio_->Play(requested_track.path, requested_track.subtrack)) {
         taskbar_preview_.Clear();
         system_media_controls_.Clear();
@@ -7160,6 +7519,24 @@ bool PlayerWindow::PlayCurrent() {
         ShowAudioError(requested_track.path);
         return false;
     }
+    if (audio_->State() == audio::PlaybackState::opening) {
+        opened_track_ = requested_track;
+        playback_source_open_ = false;
+        playback_was_active_ = true;
+        network_open_pending_ = true;
+        taskbar_preview_.Clear();system_media_controls_.Clear();
+        RefreshPlaybackUi();
+        return true;
+    }
+    return CompletePlaybackOpen(requested_track);
+}
+
+bool PlayerWindow::CompletePlaybackOpen(const playlist::Track& requested_track) {
+    network_prefetch_after_=GetTickCount64()+5000; // 0045CA57: timer 0x12
+    const auto playback_playlist_index = playing_playlist_index_;
+    const bool indexed_playback = HasPlaybackTrack() &&
+        PlaybackPlaylist().Tracks()[*current_].path == requested_track.path &&
+        PlaybackPlaylist().Tracks()[*current_].subtrack == requested_track.subtrack;
     // CSettings_SerializeXml persists these adjacent Player fields at
     // 004B6BDB..004B6C7C.  Update them only after the requested source has
     // been accepted by the engine; merely moving the playlist caret must not
@@ -7255,6 +7632,36 @@ bool PlayerWindow::PlayCurrent() {
         QueueAutomaticDiscQuery(disc_track);
     }
     return true;
+}
+
+void PlayerWindow::PollNetworkPlayback() {
+    if (!opened_track_ || !audio::AudioEngine::IsNetworkMediaLocation(opened_track_->path)) return;
+    const auto state=audio_->State();
+    if (network_open_pending_) {
+        if(state==audio::PlaybackState::opening) return;
+        network_open_pending_=false;
+        if(state==audio::PlaybackState::playing || state==audio::PlaybackState::paused) {
+            const auto track=*opened_track_;
+            CompletePlaybackOpen(track);
+        }
+        return;
+    }
+    if(!playback_source_open_ || (state!=audio::PlaybackState::playing && state!=audio::PlaybackState::paused)) return;
+    const auto metadata=audio_->Metadata();
+    if(metadata.title.empty()) return;
+    const auto title=core::WideToUtf8(metadata.title), artist=core::WideToUtf8(metadata.artist);
+    if(opened_track_->title==title && opened_track_->artist==artist) return;
+    opened_track_->title=title;opened_track_->artist=artist;
+    if(HasPlaybackTrack() && PlaybackPlaylist().Tracks()[*current_].path==opened_track_->path) {
+        PlaybackPlaylist().SetMetadata(*current_,title,artist,{});
+        if(playing_playlist_index_) playlists_.MarkDirty(*playing_playlist_index_);
+        RefreshPlaylist();
+    }
+    display_title_=DisplayName(*opened_track_);display_artist_=metadata.artist;
+    if(title_) SetWindowTextW(title_,display_title_.c_str());
+    if(artist_) SetWindowTextW(artist_,display_artist_.c_str());
+    RebuildSkinInfoItems(true);ResetSkinInfoScroll();UpdateMainWindowCaption(true);
+    system_media_controls_.SetSource(window_,BuildSystemMediaMetadata(*opened_track_,metadata),taskbar_preview_.CoverBitmap());
 }
 
 void PlayerWindow::ClearPersistedPlaybackIdentity() noexcept {
@@ -7589,6 +7996,7 @@ void PlayerWindow::AdvanceAfterNaturalEnd() {
 void PlayerWindow::Stop() {
     if (lyric_save_in_progress_ || file_info_write_in_progress_) return;
     SetSliderStatus({});
+    network_open_pending_ = false;
     CancelWaveTrackChange();
     FinishLyricDocument(false);
     random_navigation_requests_.clear();
