@@ -6974,6 +6974,11 @@ void PlayerWindow::RefreshPlaylist() {
 }
 
 void PlayerWindow::RefreshPlaybackUi() {
+    const auto marker = VisiblePlaylistPlayingRow();
+    if (playlist_playback_marker_ != marker) {
+        playlist_playback_marker_ = marker;
+        if (playlist_window_) InvalidateRect(playlist_window_, nullptr, FALSE);
+    }
     // 0045CA57 resets both the native caption and the skin info when the
     // retained track is released. Stop alone keeps that track/title intact.
     if (!PlaybackTrackForUi() && playback_error_text_.empty()) {
@@ -7841,7 +7846,7 @@ size_t PlayerWindow::NavigationTrackCount() const noexcept {
 }
 
 std::optional<size_t> PlayerWindow::NavigationPlayingRow() const {
-    if (settings_.playlist.library_mode && media_library_) return VisiblePlaylistPlayingRow();
+    if (settings_.playlist.library_mode && media_library_) return VisiblePlaylistPlaybackRow();
     if (settings_.playlist.library_mode && !media_library_ && media_library_playback_active_)
         return media_library_playback_.PlayingRow();
     return playlists_.Empty() ? std::nullopt : ActivePlaylist().PlayingRow();

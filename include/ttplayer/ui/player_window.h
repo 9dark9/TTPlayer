@@ -559,6 +559,9 @@ private:
         const playlist::Track& source,
         const std::filesystem::path& target,
         bool replace_target_metadata = false);
+    // Current source mapped into the displayed list; also used by navigation
+    // when playback is stopped. This is not a per-list history marker.
+    [[nodiscard]] std::optional<size_t> VisiblePlaylistPlaybackRow() const;
     [[nodiscard]] std::optional<size_t> VisiblePlaylistPlayingRow() const;
     bool UpdateMediaLibraryTrackFromProperties(
         size_t index, const playlist::Track& updated);
@@ -1065,6 +1068,7 @@ private:
     std::optional<size_t> current_;
     std::optional<size_t> playing_playlist_index_;
     std::optional<size_t> playlist_selection_;
+    std::optional<size_t> playlist_playback_marker_;
     std::optional<size_t> playlist_selection_anchor_;
     std::optional<size_t> playlist_list_selection_;
     std::optional<size_t> playlist_list_focus_;

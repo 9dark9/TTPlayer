@@ -1113,7 +1113,7 @@ bool PlayerWindow::CommitMediaLibraryTracks(
     if (!settings_.playlist.library_mode || !media_library_ || tracks.empty())
         return false;
     auto& state = *media_library_;
-    const bool was_idle = !VisiblePlaylistPlayingRow() &&
+    const bool was_idle = !VisiblePlaylistPlaybackRow() &&
                           !playback_source_open_;
     insertion = std::min(insertion, state.result_tracks.size());
 
@@ -1381,10 +1381,16 @@ std::pair<std::uint64_t, std::uint64_t> PlayerWindow::NavigationOrderContext() c
     return {4 + playlists_.ActiveSlot(), ActivePlaylist().OrderRevision()};
 }
 
-std::optional<size_t> PlayerWindow::VisiblePlaylistPlayingRow() const {
-    if (!settings_.playlist.library_mode || !media_library_)
-        return ActivePlaylist().PlayingRow();
+std::optional<size_t> PlayerWindow::VisiblePlaylistPlaybackRow() const {
     if (!HasPlaybackTrack()) return std::nullopt;
+    if (!settings_.playlist.library_mode || !media_library_) {
+        // CPlayList +0x1c is each list's last requested row. It survives a
+        // switch of playback owner and must not mark every visited list.
+        if (media_library_playback_active_ ||
+            playing_playlist_index_ != playlists_.ActiveIndex())
+            return std::nullopt;
+        return current_;
+    }
     const auto identity = MediaLibraryState::Identity(
         PlaybackPlaylist().Tracks()[*current_]);
     for (size_t row = 0; row < media_library_->result_items.size(); ++row) {
@@ -1393,6 +1399,23 @@ std::optional<size_t> PlayerWindow::VisiblePlaylistPlayingRow() const {
             media_library_->items[item].identity == identity) return row;
     }
     return std::nullopt;
+}
+
+std::optional<size_t> PlayerWindow::VisiblePlaylistPlayingRow() const {
+    // 00487C0D draws the arrow/highlight via 0042D719 (CPlayItem +0x9c,
+    // its live sound reference), not CPlayList +0x1c. 00452E5F attaches
+    // that reference after opening and clears it when the source stops.
+    if (!playback_source_open_ || !opened_track_ || !HasPlaybackTrack())
+        return std::nullopt;
+    const auto state = audio_->State();
+    if (state != audio::PlaybackState::playing &&
+        state != audio::PlaybackState::paused)
+        return std::nullopt;
+    const auto& track = PlaybackPlaylist().Tracks()[*current_];
+    if (track.subtrack != opened_track_->subtrack ||
+        _wcsicmp(track.path.c_str(), opened_track_->path.c_str()) != 0)
+        return std::nullopt;
+    return VisiblePlaylistPlaybackRow();
 }
 
 void PlayerWindow::UpdatePlaylistTreeFont() {
