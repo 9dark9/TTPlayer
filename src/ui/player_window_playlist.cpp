@@ -1,4 +1,4 @@
-#include "ttplayer/audio/disc_media.h"
+﻿#include "ttplayer/audio/disc_media.h"
 #include "ttplayer/i18n/i18n.h"
 #include "ttplayer/ui/wtl_menu.h"
 #include "ttplayer/ui/wtl_window.h"
@@ -10,6 +10,7 @@
 
 #include "ttplayer/core/text.h"
 #include "ttplayer/audio/builtin_file_info.h"
+#include "ttplayer/audio/archive_member.h"
 #include "ttplayer/ui/dialog_history_policy.h"
 #include "ttplayer/ui/playlist_catalog_reorder.h"
 #include "ttplayer/ui/playlist_drag_completion.h"
@@ -640,12 +641,8 @@ std::wstring FormatPlaylistItemTip(const playlist::Track& track,
     // warning is appended to the already formatted info-tip text; the
     // resource deliberately supplies its own human-readable separator.
     if (!result.empty() && !LooksLikeUrl(track.path.wstring())) {
-        auto lower = track.path.wstring();
-        std::transform(lower.begin(), lower.end(), lower.begin(), towlower);
-        const size_t zip = lower.find(L".zip|");
-        const size_t rar = lower.find(L".rar|");
-        const bool archive = (zip != std::wstring::npos && zip > 0) ||
-                             (rar != std::wstring::npos && rar > 0);
+        audio::ArchiveMemberPath member;
+        const bool archive=audio::ParseArchiveMemberPath(track.path.native(),member);
         if (!archive) {
             const DWORD attributes = GetFileAttributesW(track.path.c_str());
             if (attributes == INVALID_FILE_ATTRIBUTES ||
@@ -883,12 +880,8 @@ bool PlaylistTrackSourceValid(const playlist::Track& track) {
     auto source_type = PlaylistUtf8Field(track.media_type);
     if (_wcsicmp(source_type.c_str(), L"CD|CD Audio") == 0 ||
         extension == L".cda") return true;
-    auto lower = track.path.wstring();
-    std::transform(lower.begin(), lower.end(), lower.begin(), towlower);
-    const size_t zip = lower.find(L".zip|");
-    const size_t rar = lower.find(L".rar|");
-    if ((zip != std::wstring::npos && zip >= 1) ||
-        (rar != std::wstring::npos && rar >= 1)) return true;
+    audio::ArchiveMemberPath archive;
+    if(audio::ParseArchiveMemberPath(track.path.native(),archive))return true;
     const DWORD attributes = GetFileAttributesW(track.path.c_str());
     return attributes != INVALID_FILE_ATTRIBUTES &&
            (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
@@ -5819,11 +5812,8 @@ bool PlayerWindow::HandlePlaylistCommand(UINT command) {
         if (row >= ActivePlaylist().Tracks().size()) return true;
         auto path = ActivePlaylist().Tracks()[row].path.wstring();
         if (LooksLikeUrl(path)) return true;
-        auto lower = path;
-        std::transform(lower.begin(), lower.end(), lower.begin(), towlower);
-        size_t archive = lower.find(L".zip|");
-        if (archive == std::wstring::npos) archive = lower.find(L".rar|");
-        if (archive != std::wstring::npos) path.resize(archive + 4);
+        audio::ArchiveMemberPath archive;
+        if(audio::ParseArchiveMemberPath(path,archive))path=archive.archive.native();
         const DWORD attributes = GetFileAttributesW(path.c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES ||
             (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
@@ -6115,8 +6105,7 @@ bool PlayerWindow::HandlePlaylistCommand(UINT command) {
             const auto paths = ReadPlaylistClipboard(playlist_window_);
             if (settings_.playlist.library_mode) {
                 std::vector<playlist::Track> tracks;
-                for (const auto& path : paths)
-                    static_cast<void>(CollectImportedTracks(path, tracks));
+                static_cast<void>(CollectImportedFiles(paths, tracks));
                 static_cast<void>(CommitMediaLibraryTracks(
                     std::move(tracks), insertion, true));
             } else {

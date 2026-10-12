@@ -77,7 +77,8 @@ if ($TtpCommDirectory) {
         $commInfo.sha256 -cne $commHash -or $commInfo.runtime_api_export -cne 'ttpcomm_query_runtime' -or
         $commInfo.archive_api_export -cne 'ttpcomm_query_archive' -or
         $commInfo.archive_stream_api_export -cne 'ttpcomm_query_archive_stream' -or
-        $commInfo.archive_stream_abi -lt 2 -or
+        $commInfo.archive_stream_abi -lt 3 -or
+        ($commInfo.archive_capabilities -band 16383) -ne 16383 -or
         $commInfo.inventories -notcontains '5.1.2600.txt' -or $commInfo.inventories -notcontains '6.1.7600.txt' -or
         (Get-Item -LiteralPath $comm).VersionInfo.FileVersion -cne $commInfo.version) {
         throw 'Download and verify the TTPCOMM component before packaging.'

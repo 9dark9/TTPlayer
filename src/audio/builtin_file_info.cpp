@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 #include <windows.h>
+#include <wrl/client.h>
 
 namespace ttplayer::audio {
 namespace {
@@ -941,7 +942,8 @@ std::optional<MpegHeader> DecodeMpegHeader(std::uint32_t value) {
         (value >> 6U & 3U) == 3U ? 1U : 2U};
 }
 
-std::optional<MpegHeader> FindMpegHeader(HANDLE file,
+template <class File>
+std::optional<MpegHeader> FindMpegHeader(File file,
                                         const FileLayout& layout) {
     if (layout.body_end <= layout.body_begin) return std::nullopt;
     const std::uint64_t length = std::min<std::uint64_t>(
@@ -982,16 +984,13 @@ std::optional<MpegHeader> FindMpegHeader(HANDLE file,
     return std::nullopt;
 }
 
-HRESULT ReadMp3(const std::filesystem::path& path,
+template <class File>
+HRESULT ReadMp3Source(File file,
                 const Mp3TagPolicy& policy, BuiltinFileInfo& result) {
-    UniqueHandle file(CreateFileW(path.c_str(), GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (!file) return HRESULT_FROM_WIN32(GetLastError());
     FileLayout layout;
-    if (!ReadMp3Layout(file.Get(), layout))
+    if (!ReadMp3Layout(file, layout))
         return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
-    const auto header = FindMpegHeader(file.Get(), layout);
+    const auto header = FindMpegHeader(file, layout);
     if (!header) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
     const auto tags = MergeMp3Tags(layout, policy.read_priority);
     result.capabilities = 4U;
@@ -1030,6 +1029,15 @@ HRESULT ReadMp3(const std::filesystem::path& path,
     return S_OK;
 }
 
+HRESULT ReadMp3(const std::filesystem::path& path,
+                const Mp3TagPolicy& policy, BuiltinFileInfo& result) {
+    UniqueHandle file(CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file) return HRESULT_FROM_WIN32(GetLastError());
+    return ReadMp3Source(file.Get(), policy, result);
+}
+
 std::wstring RiffInfoName(std::string_view identifier) {
     if (identifier == "INAM") return L"Title";
     if (identifier == "IART") return L"Artist";
@@ -1041,15 +1049,12 @@ std::wstring RiffInfoName(std::string_view identifier) {
     return {};
 }
 
-HRESULT ReadWave(const std::filesystem::path& path, BuiltinFileInfo& result) {
-    UniqueHandle file(CreateFileW(path.c_str(), GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (!file) return HRESULT_FROM_WIN32(GetLastError());
+template <class File>
+HRESULT ReadWaveSource(File file, BuiltinFileInfo& result) {
     std::uint64_t file_size{};
     std::array<unsigned char, 12> riff{};
-    if (!FileSize(file.Get(), file_size) || file_size < riff.size() ||
-        !ReadAt(file.Get(), 0, riff) ||
+    if (!FileSize(file, file_size) || file_size < riff.size() ||
+        !ReadAt(file, 0, riff) ||
         std::memcmp(riff.data(), "RIFF", 4) != 0 ||
         std::memcmp(riff.data() + 8, "WAVE", 4) != 0)
         return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
@@ -1057,7 +1062,7 @@ HRESULT ReadWave(const std::filesystem::path& path, BuiltinFileInfo& result) {
     std::uint64_t data_bytes{};
     while (offset + 8 <= file_size) {
         std::array<unsigned char, 8> header{};
-        if (!ReadAt(file.Get(), offset, header)) break;
+        if (!ReadAt(file, offset, header)) break;
         const std::uint32_t size = ReadLe32(header.data() + 4);
         const std::uint64_t begin = offset + 8;
         if (size > file_size - begin) break;
@@ -1065,7 +1070,7 @@ HRESULT ReadWave(const std::filesystem::path& path, BuiltinFileInfo& result) {
             reinterpret_cast<const char*>(header.data()), 4);
         if (identifier == "fmt " && size >= 16) {
             Bytes format;
-            if (ReadRange(file.Get(), begin, std::min<std::uint32_t>(
+            if (ReadRange(file, begin, std::min<std::uint32_t>(
                     size, static_cast<std::uint32_t>(sizeof(WAVEFORMATEX))),
                     format)) {
                 std::memcpy(&result.format, format.data(),
@@ -1076,7 +1081,7 @@ HRESULT ReadWave(const std::filesystem::path& path, BuiltinFileInfo& result) {
         } else if (identifier == "LIST" && size >= 4 &&
                    size <= kMaximumTagBytes) {
             Bytes list;
-            if (ReadRange(file.Get(), begin, size, list) &&
+            if (ReadRange(file, begin, size, list) &&
                 std::memcmp(list.data(), "INFO", 4) == 0) {
                 size_t item = 4;
                 while (item + 8 <= list.size()) {
@@ -1109,6 +1114,14 @@ HRESULT ReadWave(const std::filesystem::path& path, BuiltinFileInfo& result) {
     result.codec = result.format.wFormatTag == WAVE_FORMAT_PCM
         ? L"PCM" : L"WAVE Audio";
     return S_OK;
+}
+
+HRESULT ReadWave(const std::filesystem::path& path, BuiltinFileInfo& result) {
+    UniqueHandle file(CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file) return HRESULT_FROM_WIN32(GetLastError());
+    return ReadWaveSource(file.Get(), result);
 }
 
 std::wstring PropertyText(IPropertyStore* store, const PROPERTYKEY& key) {
@@ -2095,6 +2108,43 @@ HRESULT ReadBuiltinMpegFileInfo(const std::filesystem::path& path,
         BuiltinFileInfo decoded;
         const HRESULT status = ReadMp3(path, policy, decoded);
         if (SUCCEEDED(status)) result = std::move(decoded);
+        return status;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+    catch (...) { return HRESULT_FROM_WIN32(ERROR_INVALID_DATA); }
+}
+
+HRESULT ReadBuiltinStreamInfo(IStream* stream,
+                              const std::filesystem::path& logical_path,
+                              const Mp3TagPolicy& policy,
+                              BuiltinFileInfo& result) noexcept {
+    if (!stream) return E_POINTER;
+    try {
+        Microsoft::WRL::ComPtr<IStream> cursor;
+        HRESULT status = stream->Clone(&cursor);
+        if (FAILED(status)) return status;
+        auto hint = AudioExtensionHint(logical_path);
+        status = ProbeAudioFormatHint(cursor.Get(), hint);
+        if (FAILED(status)) return status;
+        BuiltinFileInfo decoded;
+        // An extension selects the first reader, not the final format. Both
+        // parsers validate their content, including consecutive MPEG frames.
+        if (hint == L".wav" || hint == L".wave") {
+            status = ReadWaveSource(cursor.Get(), decoded);
+            if (FAILED(status)) {
+                decoded = {};
+                status = ReadMp3Source(cursor.Get(), policy, decoded);
+            }
+        } else {
+            status = ReadMp3Source(cursor.Get(), policy, decoded);
+            if (FAILED(status)) {
+                decoded = {};
+                status = ReadWaveSource(cursor.Get(), decoded);
+            }
+        }
+        if (SUCCEEDED(status)) {
+            decoded.capabilities &= ~4U;
+            result = std::move(decoded);
+        }
         return status;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
     catch (...) { return HRESULT_FROM_WIN32(ERROR_INVALID_DATA); }

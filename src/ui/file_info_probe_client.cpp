@@ -2,6 +2,7 @@
 #include "file_info_probe_client.h"
 #include "playlist_info_session_protocol.h"
 #include "ttplayer/app/file_info_worker.h"
+#include "ttplayer/audio/archive_password.h"
 #include "ttplayer/app/worker_process.h"
 
 #include <algorithm>
@@ -78,6 +79,7 @@ std::optional<FileInfoProbeReadResult> RunReadMode(
     } remove_output{output}, remove_request{request};
     FileInfoProbeReadRequest encoded_request;
     encoded_request.mp3 = mp3_policy;
+    if(arguments.size()>2)encoded_request.archive_password_packet=audio::ExportArchivePasswordPacket(arguments[2],[&]{return stop.stop_requested();});
     if (!WriteFileInfoProbeReadRequest(request, encoded_request)) {
         if (process_state)
             *process_state = FileInfoProbeProcessState::launch_failed;
@@ -364,9 +366,11 @@ std::optional<FileInfoProbeReadResult> PlaylistInfoProbeSession::Read(
         GetTickCount64() - s.last_use >= 45000) {
         if (!s.Start(helper, addin, comm)) return fail(FileInfoProbeProcessState::launch_failed);
     }
+    const auto password_packet=audio::ExportArchivePasswordPacket(path,[&]{return stop.stop_requested();});
+    if(stop.stop_requested())return fail(FileInfoProbeProcessState::cancelled);
     const auto deadline = GetTickCount64() + timeout;
     const auto request_id = ++s.next_id;
-    if (!WritePlaylistInfoSessionRequest(s.request, {request_id, path.native(), subtrack, mp3}) ||
+    if (!WritePlaylistInfoSessionRequest(s.request, {request_id, path.native(), subtrack, mp3,password_packet}) ||
         !SetEvent(s.incoming.Get())) return fail(FileInfoProbeProcessState::wait_failed);
     ++s.stats.reads;
     HANDLE waits[]{s.outgoing.Get(), s.process.Get()};

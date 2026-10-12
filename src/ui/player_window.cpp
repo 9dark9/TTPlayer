@@ -7,10 +7,12 @@
 #include "player_window_internal.h"
 #include "ttplayer/ui/wtl_runtime.h"
 #include "project_links.h"
+#include "archive_password_dialog.h"
 #include "lyric_upload_window.h"
 #include "../app/resource_ids.h"
 
 #include "ttplayer/audio/cue_sheet.h"
+#include "ttplayer/audio/archive_member.h"
 #include "ttplayer/audio/winamp_dsp.h"
 #include "ttplayer/core/text.h"
 #include "ttplayer/skin/skin_package.h"
@@ -335,7 +337,7 @@ std::vector<wchar_t> BuildAudioDialogFilter(
     for (const auto& format : formats) append_all_pattern(format.pattern);
     // FUN_004CB1DB explicitly adds archive and playlist extensions to the
     // combined filter after walking the registered readers.
-    append_all_pattern(L"*.zip;*.rar");
+    append_all_pattern(L"*.zip;*.rar;*.7z;*.tar;*.gz;*.tgz");
     const auto playlist_description = LoadResourceText(resources, 0x8125);
     const auto playlist_pattern = PatternFromDescription(playlist_description);
     append_all_pattern(playlist_pattern);
@@ -357,7 +359,7 @@ std::vector<wchar_t> BuildAudioDialogFilter(
     // 0x8126/0x8127 are appended only to CSoundLibrary's playlist-specific
     // DAT_00547FD0 filter.  0048059D consumes DAT_00547FC8, whose sole
     // playlist entry is the combined 0x8125 item.
-    AppendDialogFilter(result, LoadResourceText(resources, 0x8118), L"*.zip;*.rar");
+    AppendDialogFilter(result, LoadResourceText(resources, 0x8118), L"*.zip;*.rar;*.7z;*.tar;*.gz;*.tgz");
     const auto all_files_description = LoadResourceText(resources, 0x8124);
     AppendDialogFilter(result, all_files_description,
                        PatternFromDescription(all_files_description));
@@ -2915,6 +2917,17 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
         PromptExtensionCorrection();
         return 0;
     }
+    if (message == kMsgDeferredFileImport) {
+        if (!file_import_active_ && !deferred_import_commands_.empty()) {
+            auto requests=std::move(deferred_import_commands_);
+            deferred_import_commands_.clear();
+            for (const auto& [path, mode]:requests) {
+                if (!window_ || !IsWindow(window_)) break;
+                OpenCommandLinePath(path,mode);
+            }
+        }
+        return 0;
+    }
     if (message == kMsgMediaLibraryReady)
         return ApplyMediaLibraryIndex(lparam);
     if (message == kMsgMediaLibraryChanged)
@@ -2929,6 +2942,8 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
          message == WM_COPYDATA || message == WM_DROPFILES)) {
         return 0;
     }
+    if (file_import_active_ && (message==WM_COMMAND || message==WM_SYSCOMMAND ||
+        message==WM_CONTEXTMENU || message==WM_HOTKEY)) return 0;
     if (message == taskbar_created) {
         taskbar_playback_.Reset();
         tray_icon_added_ = false;
@@ -2970,6 +2985,8 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
         // DefWindowProc must still generate WM_SIZE/WM_MOVE for skin layout.
         break;
     case WM_CREATE:
+        InstallArchivePasswordDialog(window_,settings_.source_path.empty()?std::filesystem::path{}:
+            settings_.source_path.parent_path()/L"ArchivePasswords.dat");
         audio_->SetDspParentWindow(window_);
         audio_->SetStateNotification(window_, kMsgPlaybackStateChanged);
         CreateControls();
@@ -3811,6 +3828,11 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
         }
         return 0;
     case WM_CLOSE:
+        if (file_import_active_) {
+            file_import_deferred_close_=wparam;
+            if (IsWindow(file_import_progress_)) SendMessageW(file_import_progress_,WM_CLOSE,0,0);
+            return 0;
+        }
         if (close_after_skin_window_fade_) return 0;
         if (persistence_in_progress_ || persistence_error_open_) return 0;
         if (lyric_save_in_progress_ || file_info_write_in_progress_) return 0;
@@ -3886,10 +3908,17 @@ LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) 
             FinishCloseWhenFadesComplete();
         }
         return 0;
+    case kMsgArchivePassword:
+        DispatchArchivePasswordDialog();return 0;
+    case kMsgArchivePasswordStorageFailure:
+        ReportArchivePasswordStorageFailure(static_cast<HRESULT>(wparam));return 0;
     case WM_NCDESTROY:
         ClearTaskbarIconProperties(window_);
         break;
     case WM_DESTROY:
+        if (file_import_progress_ && IsWindow(file_import_progress_))
+            EndDialog(file_import_progress_, IDCANCEL);
+        CloseArchivePasswordDialog();
         CancelWaveTrackChange();
         if (playlist_find_progress_ && IsWindow(playlist_find_progress_))
             EndDialog(playlist_find_progress_, IDCANCEL);
@@ -7509,7 +7538,7 @@ bool PlayerWindow::PlayCurrent() {
         system_media_controls_.Clear();
         playback_source_open_ = false;
         opened_track_.reset();
-        if (indexed_playback && PlaybackPlaylist().SetDuration(*current_, -1) &&
+        if (indexed_playback && audio_->LastErrorResult()!=HRESULT_FROM_WIN32(ERROR_CANCELLED) && PlaybackPlaylist().SetDuration(*current_, -1) &&
             playback_playlist_index)
             playlists_.MarkDirty(*playback_playlist_index);
         // FUN_0047FEA3:0047FF9E publishes +0x1c through 0047FB0C even
@@ -8067,11 +8096,15 @@ void PlayerWindow::ShowAudioError(const std::filesystem::path& path) {
     // stops all three animation timers; it does not open a message box.
     playback_error_text_ = ResourceText(PlaybackErrorResource(audio_->LastErrorResult(),
         audio::AudioEngine::IsNetworkMediaLocation(path)));
+    audio::ArchiveMemberPath archive_error;
+    if(audio::ParseArchiveMemberPath(path.native(),archive_error))
+        playback_error_text_=audio::ArchiveError(audio_->LastErrorResult()).Message();
     playback_error_started_tick_ = GetTickCount64();
     RebuildSkinInfoItems(false);
     ResetSkinInfoScroll();
     if (title_) SetWindowTextW(title_, playback_error_text_.c_str());
-    pending_failed_advance_ = ShouldAdvanceAfterPlaybackFailure(settings_.playback.stop_when_fail);
+    pending_failed_advance_ = audio_->LastErrorResult()!=HRESULT_FROM_WIN32(ERROR_CANCELLED) &&
+        ShouldAdvanceAfterPlaybackFailure(settings_.playback.stop_when_fail);
     if (window_) {
         SetTimer(window_, kPlaybackErrorTimer, kPlaybackErrorDurationMs, nullptr);
         if (pending_failed_advance_)

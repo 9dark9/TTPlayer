@@ -1097,10 +1097,9 @@ public:
             catch(const ArchiveError& e){error_=e.Message();result_=e.Result();return false;}
         }
         std::wstring hint = AudioExtensionHint(path);
-        if (!archive) {
-            result_ = ProbeAudioFormatHint(path, hint);
-            if (FAILED(result_)) { error_ = HResultMessage(L"Open media file", result_); return false; }
-        }
+        result_ = archive ? ProbeAudioFormatHint(archive_stream_.Get(), hint)
+                          : ProbeAudioFormatHint(path, hint);
+        if (FAILED(result_)) { error_ = HResultMessage(L"Open media file", result_); return false; }
         const auto attempt = [&](std::unique_ptr<DecodedAudioSource> candidate, bool builtin_tags) {
             if(archive_stream_) {
                 LARGE_INTEGER zero{};result_=archive_stream_->Seek(zero,STREAM_SEEK_SET,nullptr);
@@ -1115,9 +1114,12 @@ public:
             }
             source_ = std::move(candidate);
             metadata_ = source_->Metadata();
-            if (builtin_tags && !archive) {
+            if (builtin_tags) {
                 BuiltinFileInfo info;
-                if (SUCCEEDED(ReadBuiltinMpegFileInfo(path, {}, info))) {
+                const auto status = archive
+                    ? ReadBuiltinStreamInfo(archive_stream_.Get(), path, {}, info)
+                    : ReadBuiltinMpegFileInfo(path, {}, info);
+                if (SUCCEEDED(status)) {
                     metadata_override_ = true;
                     // A system decoder need not expose ID3/APEv2 or artwork.
                     metadata_ = {};
@@ -1135,6 +1137,13 @@ public:
                     metadata_.thumbnail_interface = true;
                 }
             }
+            if (archive && metadata_.thumbnail.empty()) {
+                metadata_.thumbnail = ReadArchiveSidecarCover(path,comm_,options.network_canceled);
+                if (!metadata_.thumbnail.empty()) {
+                    metadata_.thumbnail_interface = true;
+                    metadata_override_ = true;
+                }
+            }
             result_ = S_OK; error_.clear(); return true;
         };
         if (manager_) {
@@ -1143,7 +1152,7 @@ public:
         }
         if (hint == L".wav" || hint == L".wave" || hint == L".aif" ||
             hint == L".aiff" || hint == L".aifc" || hint == L".au" || hint == L".snd") {
-            if (attempt(std::make_unique<PcmFileSource>(comm_,archive_stream_.Get()), false)) return true;
+            if (attempt(std::make_unique<PcmFileSource>(comm_,archive_stream_.Get()), archive)) return true;
             if (IsTerminalAudioOpenError(result_)) return false;
         }
         const auto system_source = [&]() -> std::unique_ptr<DecodedAudioSource> {
@@ -1373,6 +1382,12 @@ public:
         }
         display_format_ = inner_->DisplayFormat();
         metadata_ = {};
+        // The CUE owns per-track tags, while its referenced audio owns the
+        // embedded picture. Copy only the thumbnail contract, not album-level
+        // Title/Artist/Lyrics or ReplayGain into each CUE subtrack.
+        auto underlying_metadata=inner_->Metadata();
+        metadata_.thumbnail_interface=underlying_metadata.thumbnail_interface;
+        metadata_.thumbnail=std::move(underlying_metadata.thumbnail);
         metadata_.title = track_.title;
         metadata_.artist = track_.performer;
         metadata_.album = sheet_->Title();
@@ -2330,9 +2345,11 @@ bool AudioEngine::Play(const std::filesystem::path& path, int subtrack) {
         return false;
     }
 
-    // Network opens remain interactive while PAC, TLS or a slow non-range
-    // container is being read. Completion/error is published by the worker.
-    if (IsNetworkMediaLocation(path)) return true;
+    // Password requests are dispatched to the window thread. Do not block
+    // that thread waiting for a decoder which is itself waiting for its dialog.
+    // Large/solid archives also need time to finish integrity verification.
+    ArchiveMemberPath archive;
+    if (IsNetworkMediaLocation(path) || ParseArchiveMemberPath(path.native(), archive)) return true;
     // Local decoder/reader creation is synchronous in the original command.
     // Waiting here also makes Duration/Format valid before PlayerWindow
     // updates the playlist row and scrolling skin text.  A private reader is

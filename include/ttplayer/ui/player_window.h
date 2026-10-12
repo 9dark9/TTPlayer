@@ -484,6 +484,15 @@ private:
         const std::filesystem::path& path,
         std::vector<playlist::Track>& tracks, bool directory_member = false,
         std::vector<std::wstring>* directory_ancestry = nullptr);
+    [[nodiscard]] bool CollectImportedFiles(
+        const std::vector<std::filesystem::path>& paths,
+        std::vector<playlist::Track>& tracks, bool directory_member = false,
+        std::vector<std::wstring>* directory_ancestry = nullptr);
+    bool file_import_active_{};
+    bool file_import_cancelled_{};
+    HWND file_import_progress_{};
+    std::vector<std::pair<std::filesystem::path, ULONG_PTR>> deferred_import_commands_;
+    std::optional<WPARAM> file_import_deferred_close_;
     [[nodiscard]] bool CommitImportedTracks(
         std::vector<playlist::Track> tracks, size_t playlist_index,
         size_t insertion, bool replace_current, ImportPlayback playback);

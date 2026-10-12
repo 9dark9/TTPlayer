@@ -140,7 +140,8 @@ PlaylistInfoResult ReadPlaylistInfoIsolated(
             : PlaylistInfoState::failed;
         return result;
     }
-    if (ReaderUnavailable(probe->status)) {
+    if (ReaderUnavailable(probe->status) || probe->status==HRESULT(0x8004A001L) ||
+        probe->status==HRESULT(0x8004A002L) || probe->status==HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
         result.state = PlaylistInfoState::unavailable;
         return result;
     }

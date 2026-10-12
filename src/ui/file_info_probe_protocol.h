@@ -20,7 +20,7 @@ namespace ttplayer::ui::detail {
 // helper without ever terminating an in-process thread or trusting partial
 // output from a killed process.
 inline constexpr std::uint32_t kFileInfoProbeMagic = 0x50494654U; // TFIP
-inline constexpr std::uint32_t kFileInfoProbeVersion = 6;
+inline constexpr std::uint32_t kFileInfoProbeVersion = 7;
 inline constexpr std::uint32_t kFileInfoProbeReadPacket = 1;
 inline constexpr std::uint32_t kFileInfoProbeWriteRequestPacket = 2;
 inline constexpr std::uint32_t kFileInfoProbeWriteResultPacket = 3;
@@ -72,6 +72,7 @@ struct FileInfoProbeMp3Policy {
 
 struct FileInfoProbeReadRequest {
     FileInfoProbeMp3Policy mp3;
+    std::wstring archive_password_packet;
 };
 
 struct FileInfoProbeWriteRequest {
@@ -210,7 +211,8 @@ inline bool WriteFileInfoProbeReadRequest(
     if (file == INVALID_HANDLE_VALUE) return false;
     const bool okay = FileInfoProbeWriteHeader(
         file, kFileInfoProbeReadRequestPacket) &&
-        FileInfoProbeWriteMp3Policy(file, request.mp3);
+        FileInfoProbeWriteMp3Policy(file, request.mp3) &&
+        FileInfoProbeWriteWide(file, request.archive_password_packet);
     CloseHandle(file);
     if (!okay) DeleteFileW(path.c_str());
     return okay;
@@ -225,7 +227,8 @@ inline bool ReadFileInfoProbeReadRequest(
     FileInfoProbeReadRequest decoded;
     const bool okay = FileInfoProbeReadHeader(
         file, kFileInfoProbeReadRequestPacket) &&
-        FileInfoProbeReadMp3Policy(file, decoded.mp3);
+        FileInfoProbeReadMp3Policy(file, decoded.mp3) &&
+        FileInfoProbeReadWide(file, decoded.archive_password_packet);
     CloseHandle(file);
     if (okay) request = decoded;
     return okay;

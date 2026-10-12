@@ -4,6 +4,7 @@
 #include "ttplayer/ui/wtl_window.h"
 #include "ttplayer/ui/player_window.h"
 #include "player_window_internal.h"
+#include "ttplayer/audio/archive_member.h"
 #include "modern_file_dialog.h"
 #include "lyric_association_dialog.h"
 #include "lyric_alpha_mask.h"
@@ -268,7 +269,14 @@ std::wstring DecodeEditorBytes(const std::string& bytes, int& encoding,
 }
 
 std::wstring ReadEditorFile(const std::filesystem::path& path, int& encoding,
-                            bool& bom) {
+                            bool& bom, HMODULE comm) {
+    audio::ArchiveMemberPath member;
+    if (audio::ParseArchiveMemberPath(path.native(),member)) {
+        try {
+            const auto bytes = audio::ReadArchiveMember(member,comm);
+            return DecodeEditorBytes(std::string(reinterpret_cast<const char*>(bytes.data()),bytes.size()),encoding,bom);
+        } catch (...) { return {}; }
+    }
     std::ifstream input(path, std::ios::binary);
     if (!input) return {};
     const std::string bytes((std::istreambuf_iterator<char>(input)), {});
@@ -277,6 +285,7 @@ std::wstring ReadEditorFile(const std::filesystem::path& path, int& encoding,
 
 bool WriteEditorFile(const std::filesystem::path& path, std::wstring_view text,
                      int, bool) {
+    if (path.native().find(L'|') != std::wstring::npos) return false;
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output) return false;
 
@@ -2361,6 +2370,9 @@ std::filesystem::path PlayerWindow::DefaultLyricEditorPath() const {
     if (!track)
         return std::filesystem::path(L"New Lyrics.lrc");
     auto path = track->path;
+    audio::ArchiveMemberPath member;
+    if (audio::ParseArchiveMemberPath(path.native(),member))
+        path = member.archive.parent_path() / std::filesystem::path(member.member).filename();
     path.replace_extension(L".lrc");
     return path;
 }
@@ -2872,8 +2884,10 @@ bool PlayerWindow::EnterLyricEditor() {
     lyric_editor_encoding_ = kEditorEncodingUtf8;
     lyric_editor_bom_ = true;
     std::error_code error;
+    audio::ArchiveMemberPath archive_lyric;
     const bool have_source = !lyric_editor_path_.empty() &&
-        std::filesystem::exists(lyric_editor_path_, error) && !error;
+        (audio::ParseArchiveMemberPath(lyric_editor_path_.native(),archive_lyric) ||
+        (std::filesystem::exists(lyric_editor_path_, error) && !error));
     const bool have_pending_offset = lyrics_.offset !=
         std::chrono::milliseconds::zero();
     const bool modified = have_pending_offset || lyric_document_modified_;
@@ -2883,7 +2897,7 @@ bool PlayerWindow::EnterLyricEditor() {
         // editor begins at [00:00.00], without synthesized ti/ar/al/by rows,
         // and retains its three-digit timestamps until the user edits them.
         SetLyricEditorText(ReadEditorFile(lyric_editor_path_,
-            lyric_editor_encoding_, lyric_editor_bom_), false);
+            lyric_editor_encoding_, lyric_editor_bom_, ttpcomm_module_), false);
     } else {
         // A pending [offset:] cannot remain as a separate tag in edit mode:
         // CLyric serializes adjusted timestamps, removes the offset tag and
@@ -3005,11 +3019,18 @@ bool PlayerWindow::SaveLyricEditor(bool save_as, bool automatic) {
         return WriteEmbeddedLyrics(lyric_editor_ ? LyricEditorText()
             : SerializeLyricDocument(lyrics_, true), false);
     auto target = lyric_editor_ ? lyric_editor_path_ : lyric_path_;
+    audio::ArchiveMemberPath member;
+    const bool archived = audio::ParseArchiveMemberPath(target.native(),member);
+    if (archived && !save_as) {
+        MessageBoxW(lyric_window_ ? lyric_window_ : window_,
+            L"压缩包内歌词为只读，请使用“另存为”保存到普通文件。",L"保存歌词",MB_OK|MB_ICONINFORMATION);
+        return false;
+    }
     // 0044A6E6 sends the lyric HWND as lParam to 0044D824: policy saves
     // use the existing/suggested target directly, without a Save As dialog.
     if (automatic && target.empty()) target = DefaultLyricEditorPath();
     if (save_as || target.empty()) {
-        const auto suggested = target.empty() ? DefaultLyricEditorPath() : target;
+        const auto suggested = target.empty() || archived ? DefaultLyricEditorPath() : target;
         auto filter = BuildDialogFilter(ResourceModule(), {
             {0x8128U, L"*.lrc;*.txt"}, {0x8124U, L"*.*"}});
         ModernSaveFileOptions dialog;
@@ -4405,7 +4426,7 @@ void PlayerWindow::LoadLyricsFrom(const std::filesystem::path& path,
     lyrics_embedded_ = false;
     lyric_document_modified_ = false;
     try {
-        auto loaded = lyrics::LoadLrc(path);
+        auto loaded = lyrics::LoadLocalLyric(path, ttpcomm_module_);
         if (loaded.lines.empty()) throw std::runtime_error("no synchronized lyric lines");
         ApplyLyricTrimSpaces(loaded, settings_.lyric.trim_spaces);
         lyrics_ = std::move(loaded);
@@ -4441,7 +4462,7 @@ void PlayerWindow::LoadDroppedLyrics(const std::filesystem::path& path) {
     }
     int encoding = kEditorEncodingUtf8;
     bool bom = true;
-    const auto text = ReadEditorFile(path, encoding, bom);
+    const auto text = ReadEditorFile(path, encoding, bom, ttpcomm_module_);
     std::error_code error;
     if (text.empty() && std::filesystem::file_size(path, error) != 0) return;
     lyric_editor_path_ = path;
@@ -4500,6 +4521,7 @@ void PlayerWindow::LoadCurrentLyrics(bool force) {
     try { title = core::Utf8ToWide(track.title); }
     catch (const std::exception&) {}
     lyrics::LocalSearchRequest request;
+    request.archive_module = ttpcomm_module_;
     request.media = track.path; request.artist = std::move(artist); request.title = std::move(title);
     request.associated = association.value_or(std::filesystem::path{});
     request.roots = lyrics::LocalSearchRoots(track.path, PlayerRuntimeDirectory(),
@@ -4565,6 +4587,7 @@ void PlayerWindow::ShowLyricAssociation() {
     }
     const lyrics::SongKey song{track->path, track->subtrack};
     lyrics::LocalSearchRequest request;
+    request.archive_module = ttpcomm_module_;
     request.media = track->path;
     try { request.artist = core::Utf8ToWide(track->artist); request.title = core::Utf8ToWide(track->title); } catch (...) {}
     request.roots = lyrics::LocalSearchRoots(track->path, PlayerRuntimeDirectory(),

@@ -11,7 +11,8 @@
 
 namespace ttplayer::audio {
 
-enum class ArchiveKind { zip, rar };
+enum class ArchiveKind { zip, rar, tar, gzip, tar_gzip, seven_zip };
+[[nodiscard]] bool IsArchivePath(const std::filesystem::path& path);
 
 struct ArchiveMemberPath {
     std::filesystem::path archive;
@@ -62,6 +63,11 @@ private:
 [[nodiscard]] std::vector<unsigned char> ReadArchiveMember(
     const ArchiveMemberPath& path, HMODULE ttpcomm,
     const std::function<bool()>& canceled = {});
+// Embedded thumbnails remain authoritative. This fallback searches the member's
+// directory only, so a multi-album archive cannot borrow another album's cover.
+[[nodiscard]] std::vector<unsigned char> ReadArchiveSidecarCover(
+    const std::filesystem::path& media, HMODULE ttpcomm,
+    const std::function<bool()>& canceled = {});
 // The caller owns one reference; the stream remains valid independently of
 // enumeration and does not expose any extraction/cache path to the playlist.
 [[nodiscard]] IStream* OpenArchiveMemberStream(
@@ -70,7 +76,10 @@ private:
 [[nodiscard]] int ArchiveMemberProgress(IStream* stream, HMODULE ttpcomm,
                                        HRESULT* result = nullptr);
 [[nodiscard]] std::vector<std::wstring> ListArchiveMembers(
-    const std::filesystem::path& archive, HMODULE ttpcomm = nullptr);
+    const std::filesystem::path& archive, HMODULE ttpcomm = nullptr,
+    const std::function<bool()>& canceled = {},
+    const std::function<void(uint64_t, uint64_t)>& progress = {},
+    std::filesystem::path* resolved_archive = nullptr);
 [[nodiscard]] std::vector<std::wstring> ListRarArchiveMembers(
     const std::filesystem::path& archive, HMODULE ttpcomm = nullptr);
 

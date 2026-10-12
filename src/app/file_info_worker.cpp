@@ -2,12 +2,14 @@
 #include "ttplayer/platform/optional_windows_api.h"
 #include <ttpcomm/runtime_client.h>
 #include "ttplayer/app/file_info_worker.h"
+#include "ttplayer/audio/archive_password.h"
 #include "../ui/file_info_cover_policy.h"
 #include "../ui/file_info_probe_protocol.h"
 #include "../ui/file_info_write_verification.h"
 #include "../ui/playlist_info_session_protocol.h"
 
 #include "ttplayer/audio/archive_member.h"
+#include "ttplayer/audio/audio_engine.h"
 #include "ttplayer/audio/builtin_file_info.h"
 #include "ttplayer/audio/format_probe.h"
 #include "ttplayer/audio/midi_player.h"
@@ -22,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <objbase.h>
+#include <mfapi.h>
 #include <optional>
 #include <span>
 #include <string>
@@ -156,10 +159,79 @@ bool IsDirectBuiltinPath(const std::filesystem::path& path) {
 HRESULT TryBuiltinRead(const std::filesystem::path& path,
                        const ttplayer::ui::detail::FileInfoProbeMp3Policy& policy,
                        ttplayer::ui::detail::FileInfoProbeReadResult& result,
-                       bool allow_system_fallback = true) {
-    ttplayer::audio::ArchiveMemberPath archive;
-    if (ttplayer::audio::ParseArchiveMemberPath(path.native(), archive))
-        return E_NOINTERFACE;
+                       bool allow_system_fallback = true, HMODULE comm = nullptr);
+
+// Header-only metadata reads must still wait for the member's final CRC. A
+// private cursor leaves a plugin's stream position untouched.
+HRESULT VerifyArchiveInfo(IStream* stream, HMODULE comm) {
+    if (!stream) return S_OK;
+    Microsoft::WRL::ComPtr<IStream> cursor;
+    HRESULT status = stream->Clone(&cursor);
+    LARGE_INTEGER zero{};
+    if (SUCCEEDED(status)) status = cursor->Seek(zero, STREAM_SEEK_END, nullptr);
+    unsigned char byte{};
+    ULONG got{};
+    if (SUCCEEDED(status)) status = cursor->Read(&byte, 1, &got);
+    if (FAILED(status)) return status;
+    if (got) return STG_E_READFAULT;
+    (void)ttplayer::audio::ArchiveMemberProgress(stream, comm, &status);
+    return status;
+}
+
+void CloseArchiveLibrary(HMODULE comm) {
+    if (!comm) return;
+    TtpCommArchiveStreamApi api{};
+    if (ttpcomm::host::QueryArchiveStreams(comm, api)) api.clear_cache();
+    FreeLibrary(comm);
+}
+
+HRESULT TryBuiltinRead(const std::filesystem::path& path,
+                       const ttplayer::ui::detail::FileInfoProbeMp3Policy& policy,
+                       ttplayer::ui::detail::FileInfoProbeReadResult& result,
+                       bool allow_system_fallback, HMODULE comm) {
+    using namespace ttplayer;
+    audio::ArchiveMemberPath archive;
+    if (audio::ParseArchiveMemberPath(path.native(), archive)) {
+        try {
+            Microsoft::WRL::ComPtr<IStream> stream;
+            stream.Attach(audio::OpenArchiveMemberStream(archive, comm));
+            audio::BuiltinFileInfo builtin;
+            HRESULT status = audio::ReadBuiltinStreamInfo(
+                stream.Get(), path, ConvertPolicy(policy), builtin);
+            HRESULT archive_status{};
+            (void)audio::ArchiveMemberProgress(stream.Get(), comm, &archive_status);
+            if (FAILED(archive_status)) return archive_status;
+            if (FAILED(status) && allow_system_fallback && !audio::IsTerminalAudioOpenError(status)) {
+                // AIFF/AU and system codecs use the same stream-based reader
+                // as playback. Never pass archive|member to a disk/Shell API.
+                struct MediaLifetime {
+                    HRESULT status{platform::MFStartup(MF_VERSION, MFSTARTUP_LITE)};
+                    ~MediaLifetime() { if (SUCCEEDED(status)) platform::MFShutdown(); }
+                } media;
+                auto source = audio::CreateDecodedAudioSource(path, 0, nullptr, comm);
+                if (!source->Open(path, {})) return source->ErrorResult();
+                const auto format = source->DisplayFormat();
+                builtin = {};
+                builtin.format = source->OutputFormat();
+                builtin.format.cbSize = 0;
+                builtin.format.wFormatTag = format.format_tag;
+                builtin.format.nAvgBytesPerSec = format.bytes_per_second;
+                builtin.codec = format.codec_name;
+                builtin.duration_ms = static_cast<DWORD>(std::clamp<int64_t>(
+                    source->Duration().count(), 0, MAXDWORD));
+                builtin.encoded_bits_per_second = format.bytes_per_second * 8U;
+                status = S_OK;
+            }
+            if (FAILED(status)) return status;
+            status = VerifyArchiveInfo(stream.Get(), comm);
+            if (FAILED(status)) return status;
+            builtin.capabilities &= ~4U;
+            PopulateBuiltinResult(std::move(builtin), result);
+            return S_OK;
+        } catch (const audio::ArchiveError& error) { return error.Result(); }
+        catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+        catch (...) { return HRESULT_FROM_WIN32(ERROR_INVALID_DATA); }
+    }
     ttplayer::audio::BuiltinFileInfo builtin;
     const HRESULT status = ttplayer::audio::ReadBuiltinFileInfo(
         path, ConvertPolicy(policy), builtin, allow_system_fallback);
@@ -170,19 +242,18 @@ HRESULT TryBuiltinRead(const std::filesystem::path& path,
 std::unique_ptr<ttplayer::plugins::LegacyReaderSession> OpenReader(
     const ttplayer::plugins::PluginManager& manager,
     const std::filesystem::path& logical_path, HMODULE ttpcomm,
-    HRESULT* result) {
+    HRESULT* result, Microsoft::WRL::ComPtr<IStream>& archive_stream) {
     ttplayer::audio::ArchiveMemberPath member;
     if (!ttplayer::audio::ParseArchiveMemberPath(logical_path.native(), member))
         return manager.OpenReaderForInspection(logical_path, result);
 
     try {
-        Microsoft::WRL::ComPtr<IStream> stream;
-        stream.Attach(ttplayer::audio::OpenArchiveMemberStream(member, ttpcomm));
-        if (!stream) {
+        archive_stream.Attach(ttplayer::audio::OpenArchiveMemberStream(member, ttpcomm));
+        if (!archive_stream) {
             if (result) *result = E_OUTOFMEMORY;
             return {};
         }
-        return manager.OpenReaderForInspection(logical_path, stream.Get(), result);
+        return manager.OpenReaderForInspection(logical_path, archive_stream.Get(), result);
     } catch (const ttplayer::audio::ArchiveError& error) {
         if (result) *result = error.Result();
         return {};
@@ -238,6 +309,7 @@ int ReadFileInfo(const std::filesystem::path& addin_directory,
     if (!ttplayer::ui::detail::ReadFileInfoProbeReadRequest(
             request_path, request))
         return 3;
+    ttplayer::audio::ImportArchivePasswordPacket(logical_path,request.archive_password_packet);
     if (_wcsicmp(logical_path.extension().c_str(), L".cda") == 0)
         return ttplayer::ui::detail::WriteFileInfoProbeReadResult(output, ReadCdaMetadata(logical_path)) ? 0 : 4;
     HMODULE ttpcomm{};
@@ -248,25 +320,35 @@ int ReadFileInfo(const std::filesystem::path& addin_directory,
 
     ttplayer::plugins::PluginManager manager;
     bool completed{};
-    if (IsDirectBuiltinPath(logical_path)) {
-        result.status = TryBuiltinRead(logical_path, request.mp3, result, false);
+    if (ttpcomm || IsDirectBuiltinPath(logical_path)) {
+        result.status = TryBuiltinRead(logical_path, request.mp3, result, false, ttpcomm);
         completed = SUCCEEDED(result.status);
     }
     const HRESULT loaded = completed ? S_OK : manager.Load(addin_directory);
     if (!completed && SUCCEEDED(loaded)) {
         HRESULT opened{};
-        auto reader = OpenReader(manager, logical_path, ttpcomm, &opened);
+        Microsoft::WRL::ComPtr<IStream> stream;
+        auto reader = OpenReader(manager, logical_path, ttpcomm, &opened, stream);
         if (!reader) {
             result.status = FAILED(opened) ? opened : E_NOINTERFACE;
         } else {
             PopulateReaderResult(*reader, result, true);
+            if (stream) {
+                result.status = VerifyArchiveInfo(stream.Get(), ttpcomm);
+                result.capabilities &= ~4U;
+                result.cover_writable = 0;
+            }
             completed = true;
         }
     }
     if (!completed)
-        result.status = TryBuiltinRead(logical_path, request.mp3, result);
+        result.status = TryBuiltinRead(logical_path, request.mp3, result, true, ttpcomm);
+    if (ttpcomm && SUCCEEDED(result.status) && result.cover.empty()) {
+        result.cover = ttplayer::audio::ReadArchiveSidecarCover(logical_path,ttpcomm);
+        result.cover_writable = 0;
+    }
     manager.Shutdown();
-    if (ttpcomm) FreeLibrary(ttpcomm);
+    CloseArchiveLibrary(ttpcomm);
     return ttplayer::ui::detail::WriteFileInfoProbeReadResult(output, result)
         ? 0 : 4;
 }
@@ -282,7 +364,7 @@ public:
         : addin(std::move(directory)), comm_path(std::move(library)) {}
     ~PlaylistReaderContext() {
         manager.Shutdown();
-        if (comm) FreeLibrary(comm);
+        CloseArchiveLibrary(comm);
     }
     HRESULT Load() {
         if (!load_attempted) { load_attempted = true; loaded = manager.Load(addin); }
@@ -316,8 +398,12 @@ ttplayer::ui::detail::FileInfoProbeReadResult ReadPlaylistMetadata(
                 return result;
             }
             for (const auto& candidate : sheet.AudioCandidates(*track)) {
-                result = ReadPlaylistMetadata(context, candidate, 0, policy, false);
+                result = ReadPlaylistMetadata(context, candidate, 0, policy, include_cover);
                 if (SUCCEEDED(result.status)) break;
+                if (result.status == HRESULT_FROM_WIN32(ERROR_CRC) ||
+                    result.status == E_ABORT || result.status == HRESULT_FROM_WIN32(ERROR_CANCELLED) ||
+                    (result.status >= TTPCOMM_ARCHIVE_PASSWORD && result.status <= TTPCOMM_ARCHIVE_UNSUPPORTED))
+                    return result;
             }
             if (FAILED(result.status)) return result;
             const auto start = static_cast<std::int64_t>(track->start_frame * 1000U / 75U);
@@ -332,12 +418,15 @@ ttplayer::ui::detail::FileInfoProbeReadResult ReadPlaylistMetadata(
             result.metadata.clear();
             for (const auto& [key, value] : track->metadata)
                 result.metadata.push_back({key, value});
-            result.cover.clear();
-            result.cover_writable = result.cover_maximum_bytes = 0;
+            if(!include_cover)result.cover.clear();
+            result.cover_writable = 0; // The image belongs to the referenced audio.
             result.capabilities &= ~4U;
             const auto attributes = archived ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(logical_path.c_str());
             if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_READONLY))
                 result.capabilities |= 4U;
+            return result;
+        } catch (const audio::ArchiveError& error) {
+            result.status = error.Result();
             return result;
         } catch (const std::exception&) {
             result.status = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
@@ -348,18 +437,28 @@ ttplayer::ui::detail::FileInfoProbeReadResult ReadPlaylistMetadata(
     const auto comm = audio::ParseArchiveMemberPath(logical_path.native(), archive)
         ? context.ArchiveLibrary() : nullptr;
     bool completed{};
-    if (IsDirectBuiltinPath(logical_path)) {
-        result.status = TryBuiltinRead(logical_path, policy, result, false);
+    if (comm || IsDirectBuiltinPath(logical_path)) {
+        result.status = TryBuiltinRead(logical_path, policy, result, false, comm);
         completed = SUCCEEDED(result.status);
     }
     if (!completed && SUCCEEDED(context.Load())) {
         HRESULT opened{};
-        if (auto reader = OpenReader(context.manager, logical_path, comm, &opened)) {
+        Microsoft::WRL::ComPtr<IStream> stream;
+        if (auto reader = OpenReader(context.manager, logical_path, comm, &opened, stream)) {
             PopulateReaderResult(*reader, result, include_cover);
+            if (stream) {
+                result.status = VerifyArchiveInfo(stream.Get(), comm);
+                result.capabilities &= ~4U;
+                result.cover_writable = 0;
+            }
             completed = true;
         } else result.status = FAILED(opened) ? opened : E_NOINTERFACE;
     }
-    if (!completed) result.status = TryBuiltinRead(logical_path, policy, result);
+    if (!completed) result.status = TryBuiltinRead(logical_path, policy, result, true, comm);
+    if (comm && include_cover && SUCCEEDED(result.status) && result.cover.empty()) {
+        result.cover = audio::ReadArchiveSidecarCover(logical_path,comm);
+        result.cover_writable = 0;
+    }
     if (!include_cover) result.cover.clear();
     return result;
 }
@@ -370,6 +469,7 @@ int ReadCueFileInfo(const std::filesystem::path& addin,
     const std::filesystem::path& output) {
     ttplayer::ui::detail::FileInfoProbeReadRequest request;
     if (!ttplayer::ui::detail::ReadFileInfoProbeReadRequest(request_path, request)) return 3;
+    ttplayer::audio::ImportArchivePasswordPacket(path,request.archive_password_packet);
     PlaylistReaderContext context(addin, comm);
     return ttplayer::ui::detail::WriteFileInfoProbeReadResult(output,
         ReadPlaylistMetadata(context, path, subtrack, request.mp3, true)) ? 0 : 4;
@@ -382,6 +482,7 @@ int ReadPlaylistInfo(const std::filesystem::path& addin,
                      const std::filesystem::path& output) {
     ttplayer::ui::detail::FileInfoProbeReadRequest request;
     if (!ttplayer::ui::detail::ReadFileInfoProbeReadRequest(request_path, request)) return 3;
+    ttplayer::audio::ImportArchivePasswordPacket(path,request.archive_password_packet);
     PlaylistReaderContext context(addin, comm);
     return ttplayer::ui::detail::WriteFileInfoProbeReadResult(output,
         ReadPlaylistMetadata(context, path, subtrack, request.mp3)) ? 0 : 4;
@@ -403,8 +504,9 @@ int ServePlaylistInfo(wchar_t** args) {
         // usable job object. The parent restarts an idle child on the next read.
         while (WaitForSingleObject(incoming, 60000) == WAIT_OBJECT_0) {
             PlaylistInfoSessionRequest request;
-            if (!ReadPlaylistInfoSessionRequest(args[4], request) ||
-                !WritePlaylistInfoSessionResult(args[5], request.id, ReadPlaylistMetadata(
+            if (!ReadPlaylistInfoSessionRequest(args[4], request)) {code=4;break;}
+            ttplayer::audio::ImportArchivePasswordPacket(request.path,request.archive_password_packet);
+            if (!WritePlaylistInfoSessionResult(args[5], request.id, ReadPlaylistMetadata(
                     context, request.path, request.subtrack, request.mp3)) ||
                 !SetEvent(outgoing)) { code = 4; break; }
         }

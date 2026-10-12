@@ -70,6 +70,12 @@ HRESULT CreateStandardContent(IStream* stream, DWORD write_type,
     const std::filesystem::path& path, const Mp3TagPolicy& policy,
     BuiltinFileInfo& result) noexcept;
 
+// Uses an independent cursor on a clonable stream (including archive members).
+// Shares the disk MPEG/WAVE parsers and always returns read-only metadata.
+[[nodiscard]] HRESULT ReadBuiltinStreamInfo(
+    IStream* stream, const std::filesystem::path& logical_path,
+    const Mp3TagPolicy& policy, BuiltinFileInfo& result) noexcept;
+
 [[nodiscard]] BuiltinTagWriteResult WriteBuiltinFileInfo(
     const std::filesystem::path& path, const Mp3TagPolicy& policy,
     std::span<const BuiltinTagWriteField> fields,

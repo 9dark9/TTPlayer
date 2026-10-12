@@ -1,6 +1,10 @@
 #include "player_window_internal.h"
 #include "ttplayer/ui/wtl_dialogs.h"
 #include "ttplayer/i18n/i18n.h"
+#include "ttplayer/audio/archive_password.h"
+#include "ttplayer/audio/archive_member.h"
+#include <ttpcomm/archive_format.h>
+#include <ttpcomm/runtime_client.h>
 #include "../app/resource_ids.h"
 
 #include <algorithm>
@@ -16,7 +20,11 @@ std::wstring PathKey(const std::filesystem::path& path) {
     return key;
 }
 bool SamePath(const std::filesystem::path& a,const std::filesystem::path& b) {
-    return !a.empty() && !b.empty() && PathKey(a)==PathKey(b);
+    const auto outer=[](const std::filesystem::path& p){return std::filesystem::path(p.native().substr(0,p.native().find(L'|')));};
+    return !a.empty() && !b.empty() && PathKey(outer(a))==PathKey(outer(b));
+}
+std::filesystem::path Retarget(const std::filesystem::path& old,const std::filesystem::path& target){
+    const auto pipe=old.native().find(L'|');return pipe==std::wstring::npos?target:std::filesystem::path(target.native()+old.native().substr(pipe));
 }
 std::wstring SeenKey(const audio::ExtensionCorrection& c) {
     return PathKey(c.source)+L"|"+std::to_wstring(c.stamp.size)+L"|"+
@@ -80,7 +88,8 @@ void PlayerWindow::PromptExtensionCorrection() {
     auto correction=std::move(extension_corrections_.front());
     extension_corrections_.pop_front();
     const auto playback_state=audio_->State();
-    if (!playback_source_open_ || !opened_track_ || opened_track_->subtrack!=0 ||
+    if (!playback_source_open_ || !opened_track_ ||
+        (opened_track_->subtrack!=0 && opened_track_->path.native().find(L'|')==std::wstring::npos) ||
         !SamePath(opened_track_->path,correction.source) ||
         (playback_state!=audio::PlaybackState::playing &&
          playback_state!=audio::PlaybackState::paused)) return;
@@ -153,17 +162,41 @@ void PlayerWindow::PromptExtensionCorrection() {
     }
     // An outgoing crossfade can still have a file handle open.
     PollFadingAudio(true);
+    if(source.path.native().find(L'|')!=std::wstring::npos)
+        if(const auto* api=ttpcomm::host::ArchiveStreams())api->clear_cache();
     const auto result=audio::CorrectFileExtension(correction,mode,destination);
     if (!result.error) {
+        const bool archive=source.path.native().find(L'|')!=std::wstring::npos;
+        audio::RenameArchivePasswordSession(correction.source,result.target);
+        std::wstring single_member;
+        if(archive && ttpcomm::archive_format::Header(result.target.c_str())==ttpcomm::archive_format::Kind::gzip){
+            try{
+                const auto names=audio::ListArchiveMembers(result.target,ttpcomm_module_);
+                // Raw gzip has one synthesized member named after its outer
+                // file; numbering that file changes the virtual name as well.
+                if(names.size()==1)single_member=names.front();
+            }catch(const audio::ArchiveError&){/* The existing playback error path reports a changed/damaged file. */}
+        }
+        const auto retarget=[&](const std::filesystem::path& old){
+            auto path=Retarget(old,result.target);
+            if(!single_member.empty() && old.native().find(L'|')!=std::wstring::npos)
+                path=audio::MakeArchiveMemberPath(result.target,single_member);
+            return path;
+        };
         for (size_t list=0;list<playlists_.Size();++list) {
             auto& playlist=playlists_.At(list);
             bool dirty{};
             for (size_t row=0;row<playlist.Tracks().size();++row) {
                 const auto path=playlist.Tracks()[row].path;
-                if (SamePath(path,correction.source)) dirty|=playlist.SetPath(row,result.target);
+                if (SamePath(path,correction.source)) {
+                    const auto target=retarget(path);
+                    if(!archive)static_cast<void>(UpdateMediaLibraryTrackPath(playlist.Tracks()[row],target,mode==audio::ExtensionCollision::overwrite));
+                    dirty|=playlist.SetPath(row,target);
+                }
                 else if (mode==audio::ExtensionCollision::overwrite && SamePath(path,result.target)) {
                     auto replacement=source;
-                    replacement.path=result.target;
+                    replacement.path=Retarget(path,result.target);
+                    if(archive){replacement={};replacement.path=path;}
                     replacement.rating=playlist.Tracks()[row].rating;
                     replacement.subtrack=playlist.Tracks()[row].subtrack;
                     dirty|=playlist.SetTrack(row,std::move(replacement));
@@ -171,27 +204,32 @@ void PlayerWindow::PromptExtensionCorrection() {
             }
             if (dirty) playlists_.MarkDirty(list);
         }
-        static_cast<void>(UpdateMediaLibraryTrackPath(source,result.target,
+        static_cast<void>(UpdateMediaLibraryTrackPath(source,retarget(source.path),
             mode==audio::ExtensionCollision::overwrite));
         for (size_t row=0;row<media_library_playback_.Tracks().size();++row)
             if (SamePath(media_library_playback_.Tracks()[row].path,correction.source))
-                media_library_playback_.SetPath(row,result.target);
-        if (opened_track_ && SamePath(opened_track_->path,correction.source)) opened_track_->path=result.target;
+                media_library_playback_.SetPath(row,retarget(media_library_playback_.Tracks()[row].path));
+        if (opened_track_ && SamePath(opened_track_->path,correction.source)) opened_track_->path=retarget(opened_track_->path);
         else if (opened_track_ && mode==audio::ExtensionCollision::overwrite &&
             SamePath(opened_track_->path,result.target)) {
             const auto subtrack=opened_track_->subtrack;
-            opened_track_=source; opened_track_->path=result.target; opened_track_->subtrack=subtrack;
+            const auto target=Retarget(opened_track_->path,result.target);
+            opened_track_=archive?playlist::Track{}:source;
+            opened_track_->path=target; opened_track_->subtrack=subtrack;
         }
         if (SamePath(std::filesystem::path(settings_.player.playing_file_name),correction.source))
-            settings_.player.playing_file_name=result.target.wstring();
-        // Associations are keyed by the full media path; the .lrc itself stays put.
+            settings_.player.playing_file_name=retarget(settings_.player.playing_file_name).wstring();
+        // External lyrics stay put; archive members move with the outer file.
         std::vector<std::pair<lyrics::SongKey,std::filesystem::path>> associations;
         for (const auto& item:lyric_associations_.All())
-            if (SamePath(item.first.path,correction.source)) associations.push_back(item);
+            if (SamePath(item.first.path,correction.source) || SamePath(item.second,correction.source)) associations.push_back(item);
         for (const auto& [key,lyric]:associations) {
             lyric_associations_.Erase(key);
-            lyric_associations_.Set({result.target,key.subtrack},lyric);
+            lyric_associations_.Set({SamePath(key.path,correction.source)?retarget(key.path):key.path,key.subtrack},
+                SamePath(lyric,correction.source)?retarget(lyric):lyric);
         }
+        for (auto* path : {&lyric_path_, &lyric_editor_path_, &associated_lyric_path_})
+            if (SamePath(*path,correction.source)) *path=retarget(*path);
         lyric_associations_.Save();
         playlists_.FlushDirty(true);
         RefreshPlaylist();

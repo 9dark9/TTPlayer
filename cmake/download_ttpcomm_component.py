@@ -14,7 +14,7 @@ import zipfile
 from pathlib import Path
 
 from check_legacy_imports import exports, inspect
-from ttpcomm_abi import inspect_exports
+from ttpcomm_abi import inspect_exports, archive_capabilities
 
 REPOSITORY = 'https://github.com/TTPlayerRebuild/TTPlayerComm'
 API = 'https://api.github.com/repos/TTPlayerRebuild/TTPlayerComm/releases/latest'
@@ -126,6 +126,7 @@ def main():
     if args.version != 'latest' and release.get('tag_name') != args.version:
         raise ValueError('Release version mismatch')
     dll, metadata = unpack(release, args.archive.read_bytes() if args.archive else None)
+    capabilities = archive_capabilities(dll)
     folder = args.output
     folder.mkdir(parents=True, exist_ok=True)
     temporary = folder / 'ttpcomm.dll.download'
@@ -157,7 +158,8 @@ def main():
     metadata['runtime_api_export'] = 'ttpcomm_query_runtime'
     metadata['archive_api_export'] = 'ttpcomm_query_archive'
     metadata['archive_stream_api_export'] = 'ttpcomm_query_archive_stream'
-    metadata['archive_stream_abi'] = 2
+    metadata['archive_stream_abi'] = capabilities['abi']
+    metadata['archive_capabilities'] = capabilities['features']
     (args.output / 'ttpcomm-component.json').write_text(
         json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
     print(f"Staged TTPlayerComm {metadata['version']}: {len(dll)} bytes; SHA-256 and XP/Win7 imports verified")

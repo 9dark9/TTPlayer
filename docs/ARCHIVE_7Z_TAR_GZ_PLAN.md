@@ -1,6 +1,6 @@
 # 7z、TAR、GZ 音乐归档支持方案
 
-日期：2026-10-12。本文是后续实现分析，**本轮没有加入这些格式**。已完成的 ZIP／RAR 修复见 [原版对照与修复记录](ARCHIVE_CUE_ORIGINAL_PARITY_AUDIT_20261012.md)。
+日期：2026-10-12。本文件保留实施前的方案。**本轮已实现 TAR、gzip、tar.gz／tgz 和 7z，并补齐 UTF-8 ZIP／ZIP64；实际范围、只读依据和三系统测试见 [实施记录](ARCHIVE_EXTENSIONS_AND_READONLY_20261012.md)。**
 
 ## 1. 与 5.7.9 原版的关系
 

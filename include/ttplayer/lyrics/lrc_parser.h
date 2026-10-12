@@ -35,6 +35,7 @@ struct Lyrics {
 };
 Lyrics ParseLrc(std::string_view content);
 Lyrics LoadLrc(const std::filesystem::path& path);
+Lyrics DecodeLrcBytes(std::string_view bytes);
 std::optional<std::chrono::milliseconds> ParseLrcTimestamp(std::string_view value,
                                                         bool centisecond_rollover = false);
 // Contents of one [start,end] tag. Colon fractions require three digits;

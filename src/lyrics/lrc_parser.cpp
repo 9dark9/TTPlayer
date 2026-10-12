@@ -169,6 +169,10 @@ Lyrics LoadLrc(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input) throw std::runtime_error("cannot open lyric file");
     std::string bytes((std::istreambuf_iterator<char>(input)), {});
+    return DecodeLrcBytes(bytes);
+}
+Lyrics DecodeLrcBytes(std::string_view bytes) {
+    if (bytes.size() > INT_MAX) throw std::runtime_error("lyric file too large");
     if (bytes.starts_with("\xEF\xBB\xBF"))
         return ParseLrc(std::string_view(bytes).substr(3));
 

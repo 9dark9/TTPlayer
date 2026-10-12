@@ -11,6 +11,7 @@
 #include "file_info_probe_client.h"
 
 #include "ttplayer/core/text.h"
+#include "ttplayer/audio/archive_member.h"
 
 #include <algorithm>
 #include <array>
@@ -357,9 +358,8 @@ bool LibraryTrackSourceValid(const playlist::Track& track) {
     if (extension == L".cda" ||
         _wcsicmp(Wide(track.media_type).c_str(), L"CD|CD Audio") == 0)
         return true;
-    auto lower = Fold(source);
-    if (lower.find(L".zip|") != std::wstring::npos ||
-        lower.find(L".rar|") != std::wstring::npos) return true;
+    audio::ArchiveMemberPath archive;
+    if (audio::ParseArchiveMemberPath(source,archive)) return true;
     const DWORD attributes = GetFileAttributesW(track.path.c_str());
     return attributes != INVALID_FILE_ATTRIBUTES &&
            (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
@@ -1191,6 +1191,61 @@ bool PlayerWindow::UpdateMediaLibraryTrackPath(
     bool replace_target_metadata) {
     if (!media_library_ || target.empty()) return false;
     auto& state = *media_library_;
+    const auto source_pipe = source.path.native().find(L'|');
+    const auto target_pipe = target.native().find(L'|');
+    if (source_pipe != std::wstring::npos && target_pipe != std::wstring::npos) {
+        const auto before = source.path.native().substr(0, source_pipe);
+        const auto after = target.native().substr(0, target_pipe);
+        const auto matches = [](const std::filesystem::path& path, const std::wstring& outer) {
+            const auto pipe = path.native().find(L'|');
+            return pipe == outer.size() && !_wcsnicmp(path.c_str(), outer.c_str(), pipe);
+        };
+        // Move all members, including library-only tracks and in-flight seeds.
+        // Never copy one member's tags over a different member of the archive.
+        bool changed = false;
+        const auto excluded_before = state.excluded;
+        const auto update = [&](playlist::Track& track) {
+            const auto old_identity = MediaLibraryState::Identity(track);
+            const bool removed = excluded_before.contains(old_identity);
+            if (matches(track.path, before)) {
+                track.path = track.path.native().substr(source_pipe)==source.path.native().substr(source_pipe)
+                    ? target : std::filesystem::path(after + track.path.native().substr(source_pipe));
+                state.excluded.insert(old_identity);
+                state.removed_files.erase(old_identity);
+                state.edits.erase(old_identity);
+                if (removed) state.excluded.insert(MediaLibraryState::Identity(track));
+                else state.RecordEdit(track);
+            } else if (replace_target_metadata && matches(track.path, after)) {
+                playlist::Track empty;
+                empty.path = track.path;
+                empty.rating = track.rating;
+                empty.subtrack = track.subtrack;
+                track = std::move(empty);
+                if (!removed) state.RecordEdit(track);
+            } else return false;
+            changed = true;
+            return true;
+        };
+        // Copy edits first: update() can replace their map keys.
+        std::vector<playlist::Track> edits;
+        for (const auto& [id, edit] : state.edits) edits.push_back(edit.track);
+        for (auto& track : edits) update(track);
+        for (auto& item : state.items) {
+            if (update(item.track)) item.identity = MediaLibraryState::Identity(item.track);
+        }
+        for (auto* tracks : {&state.result_tracks, &state.persisted_tracks, &state.pending_tracks})
+            for (auto& track : *tracks) update(track);
+        for (size_t row = 0; row < media_library_playback_.Tracks().size(); ++row) {
+            auto track = media_library_playback_.Tracks()[row];
+            if (update(track)) media_library_playback_.SetTrack(row, std::move(track));
+        }
+        if (!changed) return false;
+        state.order_revision = playlist::NextPlaybackOrderRevision();
+        settings_.library.valid = true;
+        state.refresh_pending = true;
+        if (!state.indexing) StartMediaLibraryRefresh();
+        return true;
+    }
     auto updated = source;
     updated.path = target;
     bool changed{};
@@ -2488,10 +2543,8 @@ bool PlayerWindow::HandleMediaLibraryCommand(UINT command) {
         // returns immediately for network items.  "Browse file" is an
         // Explorer-selection command, not a second way to launch a stream.
         if (path.find(L"://") != std::wstring::npos) return true;
-        auto lower = Fold(path);
-        size_t archive = lower.find(L".zip|");
-        if (archive == std::wstring::npos) archive = lower.find(L".rar|");
-        if (archive != std::wstring::npos) path.resize(archive + 4);
+        audio::ArchiveMemberPath archive;
+        if(audio::ParseArchiveMemberPath(path,archive))path=archive.archive.native();
         const DWORD attributes = GetFileAttributesW(path.c_str());
         if (attributes != INVALID_FILE_ATTRIBUTES &&
             (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {

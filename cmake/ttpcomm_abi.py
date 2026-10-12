@@ -5,6 +5,42 @@ import json
 import struct
 from pathlib import Path
 
+def archive_capabilities(data):
+    """Read the versioned archive capability resource; never execute the DLL."""
+    def read(fmt, at):
+        n=struct.calcsize('<'+fmt)
+        if at<0 or at+n>len(data):raise ValueError('Truncated archive capability PE')
+        return struct.unpack_from('<'+fmt,data,at)
+    if data[:2]!=b'MZ':raise ValueError('Missing MZ header')
+    pe,=read('I',0x3c)
+    if data[pe:pe+4]!=b'PE\0\0' or read('H',pe+4)[0]!=0x14c:raise ValueError('Expected x86 PE')
+    opt=pe+24
+    if read('H',opt)[0]!=0x10b:raise ValueError('Expected PE32')
+    sections=[read('IIII',opt+read('H',pe+20)[0]+40*i+8) for i in range(read('H',pe+6)[0])]
+    def mapped(rva,n):
+        for _,va,size,raw in sections:
+            if va<=rva and rva-va+n<=size and raw+rva-va+n<=len(data):return raw+rva-va
+        raise ValueError('Unmapped archive capability resource')
+    base,size=read('II',opt+112)
+    def relative(at,n):
+        if at<0 or at+n>size:raise ValueError('Invalid resource offset')
+        return mapped(base+at,n)
+    def child(at,identifier,directory):
+        named,numbered=read('HH',relative(at,16)+12)
+        for i in range(named+numbered):
+            name,target=read('II',relative(at+16+8*i,8))
+            if name==identifier:
+                if bool(target&0x80000000)!=directory:raise ValueError('Invalid resource tree')
+                return target&0x7fffffff
+        raise ValueError('TTPCOMM release lacks extended archive capability metadata; publish the updated DLL first')
+    at=child(child(child(0,10,True),503,True),0,False)
+    payload,n=read('II',relative(at,16))
+    if n!=16:raise ValueError('Invalid archive capability size')
+    magic,version,abi,features=read('IIII',mapped(payload,n))
+    if magic!=0x41435054 or version!=1 or abi<3 or features&16383!=16383:
+        raise ValueError('TTPCOMM lacks required archive/password/signature/7z BZip2/Zstandard capabilities; publish the updated DLL first')
+    return {'abi':abi,'features':features}
+
 def inspect_exports(path):
     data=path.read_bytes()
     def unpack(fmt,offset):return struct.unpack_from('<'+fmt,data,offset)

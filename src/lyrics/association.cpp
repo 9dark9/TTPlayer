@@ -15,8 +15,28 @@ bool SongKey::operator==(const SongKey& other) const noexcept {
 namespace {
 bool Field(const std::filesystem::path& path) {
     const auto& value = path.native();
-    return !value.empty() && value.find_first_of(L"|\r\n") == value.npos &&
+    return !value.empty() && value.find_first_of(L"\r\n") == value.npos &&
         value.find(L'\0') == value.npos;
+}
+constexpr std::wstring_view kEscaped = L"@TTPlayerLyricAssociation/2|";
+std::wstring Escape(std::wstring_view value) {
+    std::wstring out;
+    for (const auto c : value) {
+        if (c == L'%') out += L"%25";
+        else if (c == L'|') out += L"%7C";
+        else out += c;
+    }
+    return out;
+}
+bool Unescape(std::wstring& value) {
+    std::wstring out;
+    for (size_t i=0; i<value.size(); ++i) {
+        if (value[i] != L'%') out += value[i];
+        else if (value.compare(i,3,L"%25") == 0) { out += L'%'; i+=2; }
+        else if (value.compare(i,3,L"%7C") == 0) { out += L'|'; i+=2; }
+        else return false;
+    }
+    value = std::move(out); return true;
 }
 }
 bool AssociationStore::Load(const std::filesystem::path& file) {
@@ -39,6 +59,8 @@ bool AssociationStore::Load(const std::filesystem::path& file) {
         std::wistringstream lines(text);
         for (std::wstring line; std::getline(lines, line);) {
             if (!line.empty() && line.back() == L'\r') line.pop_back();
+            const bool escaped = line.starts_with(kEscaped);
+            if (escaped) line.erase(0,kEscaped.size());
             const auto first = line.find(L'|');
             if (first == line.npos || !first) continue;
             const auto second = line.find(L'|', first + 1);
@@ -50,7 +72,14 @@ bool AssociationStore::Load(const std::filesystem::path& file) {
                 catch (...) { continue; }
                 if (used != number.size() || key.subtrack < 0) continue;
             }
-            const std::filesystem::path value = line.substr((second == line.npos ? first : second) + 1);
+            auto value_text = line.substr((second == line.npos ? first : second) + 1);
+            if (value_text.find(L'|') != value_text.npos) continue;
+            if (escaped) {
+                auto key_text = key.path.native();
+                if (second == line.npos || !Unescape(key_text) || !Unescape(value_text)) continue;
+                key.path = key_text;
+            }
+            const std::filesystem::path value = value_text;
             if (Field(key.path) && Field(value)) entries_.insert_or_assign(std::move(key), value);
         }
         file_ = file;
@@ -86,9 +115,13 @@ bool AssociationStore::Save() {
     try {
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         output << "\xef\xbb\xbf";
-        for (const auto& [key, value] : entries_)
-            output << core::WideToUtf8(key.path.native()) << '|' << key.subtrack << '|'
-                   << core::WideToUtf8(value.native()) << "\r\n";
+        for (const auto& [key, value] : entries_) {
+            const bool escaped = key.path.native().find(L'|') != std::wstring::npos ||
+                value.native().find(L'|') != std::wstring::npos || key.path.native().starts_with(kEscaped);
+            if (escaped) output << core::WideToUtf8(kEscaped);
+            output << core::WideToUtf8(escaped ? Escape(key.path.native()) : key.path.native()) << '|' << key.subtrack << '|'
+                   << core::WideToUtf8(escaped ? Escape(value.native()) : value.native()) << "\r\n";
+        }
         output.flush(); okay = output.good(); output.close(); okay &= !output.fail();
         if (okay) okay = MoveFileExW(temporary, file_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
     } catch (...) { okay = false; }

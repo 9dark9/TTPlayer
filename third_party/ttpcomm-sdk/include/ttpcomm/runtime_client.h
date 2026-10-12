@@ -13,4 +13,6 @@ const TtpCommArchiveApi* Archive() noexcept;
 bool QueryArchive(HMODULE module, TtpCommArchiveApi& api) noexcept;
 const TtpCommArchiveStreamApi* ArchiveStreams() noexcept;
 bool QueryArchiveStreams(HMODULE module, TtpCommArchiveStreamApi& api) noexcept;
+bool QueryArchiveGroups(HMODULE module, TtpCommArchiveGroupApi& api) noexcept;
+const TtpCommArchiveGroupApi* ArchiveGroups() noexcept;
 }

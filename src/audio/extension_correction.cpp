@@ -1,5 +1,6 @@
 #include "ttplayer/audio/extension_correction.h"
 #include "ttplayer/audio/format_probe.h"
+#include <ttpcomm/archive_format.h>
 
 #include <algorithm>
 #include <array>
@@ -133,16 +134,34 @@ std::optional<MediaFileStamp> ReadMediaFileStamp(const std::filesystem::path& pa
     return Stamp(file.value);
 }
 
-std::optional<ExtensionCorrection> FindExtensionCorrection(const std::filesystem::path& path, int subtrack) {
-    const auto value=path.native();
-    if (subtrack!=0 || value.find(L"://")!=std::wstring::npos ||
-        value.find(L'|')!=std::wstring::npos || path.empty()) return {};
+std::optional<ExtensionCorrection> FindExtensionCorrection(const std::filesystem::path& input, int subtrack) {
+    const auto value=input.native();const auto pipe=value.find(L'|');
+    if (value.find(L"://")!=std::wstring::npos || input.empty()) return {};
+    const std::filesystem::path path=pipe==std::wstring::npos?input:std::filesystem::path(value.substr(0,pipe));
+    const auto archive=ttpcomm::archive_format::Header(path.c_str());
+    if ((subtrack!=0 || pipe!=std::wstring::npos) && archive==ttpcomm::archive_format::Kind::unknown) return {};
     // Do not rename links or CUE/CD tracks to their underlying stream type.
     const DWORD attributes=GetFileAttributesW(path.c_str());
     if (attributes==INVALID_FILE_ATTRIBUTES || (attributes&FILE_ATTRIBUTE_REPARSE_POINT)) return {};
     File file(path);
     const auto before=Stamp(file.value);
     if (!before) return {};
+    if(archive!=ttpcomm::archive_format::Kind::unknown){
+        using K=ttpcomm::archive_format::Kind;const wchar_t* suffix=nullptr;const wchar_t* name=nullptr;
+        switch(archive){
+        case K::zip:suffix=L".zip";name=L"ZIP 压缩包";break;
+        case K::rar:suffix=L".rar";name=L"RAR 压缩包";break;
+        case K::seven:suffix=L".7z";name=L"7z 压缩包";break;
+        case K::tar:suffix=L".tar";name=L"TAR 归档";break;
+        case K::gzip:suffix=L".gz";name=L"gzip 压缩包";break;
+        default:break;
+        }
+        if(!suffix)return {};
+        const auto existing=ttpcomm::archive_format::Suffix(path.c_str());
+        if(existing==archive || archive==K::gzip && existing==K::targzip)return {};
+        auto target=path;target.replace_extension(suffix);if(Stamp(file.value)!=before)return {};
+        return ExtensionCorrection{path,target,name,*before};
+    }
     std::array<unsigned char,65536> bytes{};
     DWORD count{};
     if (!ReadFile(file.value,bytes.data(),static_cast<DWORD>(bytes.size()),&count,nullptr)) return {};

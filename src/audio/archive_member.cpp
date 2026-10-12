@@ -1,4 +1,6 @@
 #include "ttplayer/audio/archive_member.h"
+#include "ttplayer/audio/archive_password.h"
+#include <ttpcomm/archive_format.h>
 
 #include <ttpcomm/runtime_client.h>
 
@@ -27,18 +29,29 @@ size_t FindZipMarker(std::wstring_view value) noexcept {
     return std::wstring_view::npos;
 }
 
-size_t FindRarMarker(std::wstring_view value) noexcept {
-    if (value.size() < 6) return std::wstring_view::npos;
-    for (size_t index = 1; index + 5 <= value.size(); ++index) {
-        if (value[index] == L'.' &&
-            towlower(value[index + 1]) == L'r' &&
-            towlower(value[index + 2]) == L'a' &&
-            towlower(value[index + 3]) == L'r' &&
-            value[index + 4] == L'|') {
-            return index;
+bool PathKind(std::wstring_view value, ArchiveKind& kind) {
+    const auto detected=ttpcomm::archive_format::Detect(std::wstring(value).c_str());
+    switch(detected){
+    case ttpcomm::archive_format::Kind::zip:kind=ArchiveKind::zip;return true;
+    case ttpcomm::archive_format::Kind::rar:kind=ArchiveKind::rar;return true;
+    case ttpcomm::archive_format::Kind::seven:kind=ArchiveKind::seven_zip;return true;
+    case ttpcomm::archive_format::Kind::tar:kind=ArchiveKind::tar;return true;
+    case ttpcomm::archive_format::Kind::gzip:kind=ArchiveKind::gzip;return true;
+    case ttpcomm::archive_format::Kind::targzip:kind=ArchiveKind::tar_gzip;return true;
+    default:break;
+    }
+    struct Suffix {const wchar_t* text; ArchiveKind kind;};
+    constexpr Suffix formats[]={{L".tar.gz",ArchiveKind::tar_gzip},
+        {L".zip",ArchiveKind::zip},{L".rar",ArchiveKind::rar},
+        {L".tar",ArchiveKind::tar},{L".tgz",ArchiveKind::tar_gzip},
+        {L".gz",ArchiveKind::gzip},{L".7z",ArchiveKind::seven_zip}};
+    for(const auto& format:formats) {
+        const size_t n=wcslen(format.text);
+        if(value.size()>n && _wcsnicmp(value.data()+value.size()-n,format.text,n)==0) {
+            kind=format.kind;return true;
         }
     }
-    return std::wstring_view::npos;
+    return false;
 }
 
 std::filesystem::path NormalizeArchiveMember(std::wstring_view value) {
@@ -63,42 +76,60 @@ TtpCommArchiveStreamApi ArchiveApi(HMODULE module) {
     } else if(const auto* loaded=ttpcomm::host::ArchiveStreams()) return *loaded;
     throw ArchiveError(HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH));
 }
+TtpCommArchiveGroupApi GroupApi(HMODULE module){
+    TtpCommArchiveGroupApi api{};
+    if(module)ttpcomm::host::QueryArchiveGroups(module,api);
+    else if(const auto* loaded=ttpcomm::host::ArchiveGroups())api=*loaded;
+    return api;
+}
 
 // Decoder clones must retain their cancellation context too. The DLL producer
 // never owns a callback into a destroyed AudioEngine or metadata worker.
-class OwnedArchiveStream final : public IStream {
+class OwnedArchiveStream final : public IStream, public TtpCommArchiveStreamStatusInterface {
     std::atomic<ULONG> references_{1};
     std::shared_ptr<std::function<bool()>> canceled_;
     Microsoft::WRL::ComPtr<IStream> inner_;
+    decltype(TtpCommArchiveStreamApi::status) status_;
+    std::filesystem::path archive_;
+    HRESULT Result(HRESULT hr){
+        if(hr==HRESULT_FROM_WIN32(ERROR_CRC) || hr==HRESULT_FROM_WIN32(ERROR_INVALID_DATA) ||
+           hr==TTPCOMM_ARCHIVE_MISSING_VOLUME || hr==STG_E_READFAULT)DiscardArchiveVolumes(archive_);
+        return hr;
+    }
 public:
-    OwnedArchiveStream(std::shared_ptr<std::function<bool()>> canceled,IStream* stream)
-        : canceled_(std::move(canceled)) {inner_.Attach(stream);}
+    OwnedArchiveStream(std::shared_ptr<std::function<bool()>> canceled,IStream* stream,
+                       decltype(TtpCommArchiveStreamApi::status) status,const std::filesystem::path& archive)
+        : canceled_(std::move(canceled)),status_(status),archive_(archive) {inner_.Attach(stream);}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** out) override {
         if(!out)return E_POINTER;*out=nullptr;
         if(id==IID_IUnknown || id==IID_IStream || id==IID_ISequentialStream){*out=static_cast<IStream*>(this);AddRef();return S_OK;}
-        return inner_->QueryInterface(id,out);
+        // Never expose the inner stream: it borrows our cancellation context.
+        if(id==IID_TtpCommArchiveStreamStatus){*out=static_cast<TtpCommArchiveStreamStatusInterface*>(this);AddRef();return S_OK;}
+        return E_NOINTERFACE;
     }
     ULONG STDMETHODCALLTYPE AddRef() override{return ++references_;}
     ULONG STDMETHODCALLTYPE Release() override{const auto n=--references_;if(!n)delete this;return n;}
-    HRESULT STDMETHODCALLTYPE Read(void* p,ULONG n,ULONG* r) override{return inner_->Read(p,n,r);}
+    HRESULT STDMETHODCALLTYPE Snapshot(TtpCommArchiveStreamStatus* out) override{return status_(inner_.Get(),out);}
+    HRESULT STDMETHODCALLTYPE Read(void* p,ULONG n,ULONG* r) override{return Result(inner_->Read(p,n,r));}
     HRESULT STDMETHODCALLTYPE Write(const void* p,ULONG n,ULONG* r) override{return inner_->Write(p,n,r);}
-    HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER p,DWORD w,ULARGE_INTEGER* r) override{return inner_->Seek(p,w,r);}
+    HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER p,DWORD w,ULARGE_INTEGER* r) override{return Result(inner_->Seek(p,w,r));}
     HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER n) override{return inner_->SetSize(n);}
     HRESULT STDMETHODCALLTYPE CopyTo(IStream* s,ULARGE_INTEGER n,ULARGE_INTEGER* r,ULARGE_INTEGER* w) override{return inner_->CopyTo(s,n,r,w);}
     HRESULT STDMETHODCALLTYPE Commit(DWORD f) override{return inner_->Commit(f);}
     HRESULT STDMETHODCALLTYPE Revert() override{return inner_->Revert();}
     HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER a,ULARGE_INTEGER b,DWORD c) override{return inner_->LockRegion(a,b,c);}
     HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER a,ULARGE_INTEGER b,DWORD c) override{return inner_->UnlockRegion(a,b,c);}
-    HRESULT STDMETHODCALLTYPE Stat(STATSTG* s,DWORD f) override{return inner_->Stat(s,f);}
+    HRESULT STDMETHODCALLTYPE Stat(STATSTG* s,DWORD f) override{return Result(inner_->Stat(s,f));}
     HRESULT STDMETHODCALLTYPE Clone(IStream** out) override {
         if(!out)return E_POINTER;*out=nullptr;Microsoft::WRL::ComPtr<IStream> clone;
         const auto hr=inner_->Clone(&clone);if(FAILED(hr))return hr;
-        try{*out=new OwnedArchiveStream(canceled_,clone.Get());clone.Detach();return S_OK;}catch(...){return E_OUTOFMEMORY;}
+        try{*out=new OwnedArchiveStream(canceled_,clone.Get(),status_,archive_);clone.Detach();return S_OK;}catch(...){return E_OUTOFMEMORY;}
     }
 };
 IStream* OpenMember(const ArchiveMemberPath& path,HMODULE module,
                     const std::function<bool()>& canceled,bool cache,uint64_t limit) {
     const auto api=ArchiveApi(module);
+    const auto group=GroupApi(module);auto volumes=ArchiveVolumeOptions(&canceled);
     auto control=std::make_shared<std::function<bool()>>(canceled);
     TtpCommArchiveStreamOptions options{};options.size=sizeof(options);
     options.flags=cache?TTPCOMM_ARCHIVE_CACHE_CURRENT:0;
@@ -107,10 +138,23 @@ IStream* OpenMember(const ArchiveMemberPath& path,HMODULE module,
         const auto& fn=*static_cast<std::function<bool()>*>(context);return fn && fn();
     };
     Microsoft::WRL::ComPtr<IStream> stream;
-    const auto hr=api.open_member(path.archive.c_str(),path.member.c_str(),&options,&stream);
-    if(FAILED(hr))throw ArchiveError(hr);
+    const auto hr=WithArchivePassword(path.archive,[&](const wchar_t* password)->HRESULT {
+        stream.Reset();options.limits.password=password;
+        auto result=group.open_member?group.open_member(path.archive.c_str(),path.member.c_str(),&options,&volumes,&stream)
+            :api.open_member(path.archive.c_str(),path.member.c_str(),&options,&stream);
+        if(FAILED(result) || !stream || !password)return result;
+        // A password verifier alone is not proof: ZipCrypto has only 8 check
+        // bits. Wait for the member CRC / AES authentication before accepting
+        // a candidate or exposing plaintext to a decoder.
+        LARGE_INTEGER zero{};result=stream->Seek(zero,STREAM_SEEK_END,nullptr);
+        if(FAILED(result))return result;unsigned char byte{};ULONG read{};
+        result=stream->Read(&byte,1,&read);if(FAILED(result))return result;
+        if(read)return STG_E_READFAULT;
+        return stream->Seek(zero,STREAM_SEEK_SET,nullptr);
+    },canceled);
+    if(FAILED(hr)){if(hr!=TTPCOMM_ARCHIVE_PASSWORD && hr!=TTPCOMM_ARCHIVE_BAD_PASSWORD)DiscardArchiveVolumes(path.archive);throw ArchiveError(hr);}
     if(!stream)throw ArchiveError(E_UNEXPECTED);
-    auto* result=new OwnedArchiveStream(std::move(control),stream.Get());stream.Detach();return result;
+    auto* result=new OwnedArchiveStream(std::move(control),stream.Get(),api.status,path.archive);stream.Detach();return result;
 }
 
 } // namespace
@@ -119,9 +163,9 @@ ArchiveError::ArchiveError(HRESULT result)
     : std::runtime_error("Archive operation failed: " + std::to_string(static_cast<unsigned long>(result))),result_(result) {}
 
 std::wstring ArchiveError::Message() const {
-    if(result_==TTPCOMM_ARCHIVE_PASSWORD) return L"压缩包需要密码，当前播放器未提供密码输入。";
-    if(result_==TTPCOMM_ARCHIVE_BAD_PASSWORD) return L"压缩包密码不正确。";
-    if(result_==TTPCOMM_ARCHIVE_MISSING_VOLUME) return L"压缩包缺少分卷，请将全部分卷放在同一目录。";
+    if(result_==TTPCOMM_ARCHIVE_PASSWORD) return L"压缩包需要密码。请播放或重新添加该压缩包以输入密码。";
+    if(result_==TTPCOMM_ARCHIVE_BAD_PASSWORD) return L"压缩包密码不正确，或加密数据已损坏。";
+    if(result_==TTPCOMM_ARCHIVE_MISSING_VOLUME) return L"压缩包缺少分卷。请重新导入并选择所需分卷，或将全部分卷放在同一目录。";
     if(result_==TTPCOMM_ARCHIVE_DICTIONARY_LIMIT) return L"压缩包所需的解压字典超过播放器的内存限制。";
     if(result_==TTPCOMM_ARCHIVE_UNSUPPORTED) return L"不支持此压缩方式或成员类型。";
     if(result_==HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH)) return L"ttpcomm.dll 缺少归档接口，请手动替换完整发行包。";
@@ -178,25 +222,24 @@ std::vector<unsigned char> ReadZipMember(const ZipMemberPath& path,
 
 bool ParseArchiveMemberPath(std::wstring_view logical_path,
                             ArchiveMemberPath& result) {
-    const size_t zip = FindZipMarker(logical_path);
-    const size_t rar = FindRarMarker(logical_path);
-    const bool use_zip = zip != std::wstring_view::npos &&
-        (rar == std::wstring_view::npos || zip < rar);
-    const size_t marker = use_zip ? zip : rar;
-    if (marker == std::wstring_view::npos || marker + 5 >= logical_path.size())
-        return false;
-    result.archive = std::filesystem::path(logical_path.substr(0, marker + 4));
-    result.member.assign(logical_path.substr(marker + 5));
+    const size_t marker=logical_path.find(L'|');
+    ArchiveKind kind{};
+    if(marker==std::wstring_view::npos || marker+1>=logical_path.size() ||
+       !PathKind(logical_path.substr(0,marker),kind))return false;
+    result.archive = std::filesystem::path(logical_path.substr(0, marker));
+    result.member.assign(logical_path.substr(marker + 1));
     std::replace(result.member.begin(), result.member.end(), L'/', L'\\');
-    result.kind = use_zip ? ArchiveKind::zip : ArchiveKind::rar;
+    result.kind = kind;
     return !result.archive.empty() && !result.member.empty();
+}
+
+bool IsArchivePath(const std::filesystem::path& path) {
+    ArchiveKind kind{};return PathKind(path.native(),kind);
 }
 
 std::filesystem::path MakeArchiveMemberPath(
     const std::filesystem::path& archive, std::wstring_view member) {
-    auto extension = archive.extension().wstring();
-    std::ranges::transform(extension, extension.begin(), towlower);
-    if (extension != L".zip" && extension != L".rar")
+    if (!IsArchivePath(archive))
         throw std::runtime_error("unsupported archive path");
     std::wstring logical = archive.wstring();
     logical.push_back(L'|');
@@ -216,7 +259,7 @@ std::vector<unsigned char> ReadArchiveMember(const ArchiveMemberPath& path, HMOD
     Microsoft::WRL::ComPtr<IStream> stream;
     stream.Attach(OpenMember(path,ttpcomm,canceled,false,limit));
     STATSTG stat{}; HRESULT result=stream->Stat(&stat,STATFLAG_NONAME);
-    if(FAILED(result)) throw ArchiveError(result);
+    if(FAILED(result))throw ArchiveError(result);
     if(stat.cbSize.QuadPart>limit) throw ArchiveError(HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE));
     std::vector<unsigned char> bytes(static_cast<size_t>(stat.cbSize.QuadPart));
     ULONG read{}; result=stream->Read(bytes.data(),static_cast<ULONG>(bytes.size()),&read);
@@ -238,19 +281,77 @@ int ArchiveMemberProgress(IStream* stream,HMODULE ttpcomm,HRESULT* result) {
     }catch(const ArchiveError& error){if(result)*result=error.Result();return -1;}
 }
 
-std::vector<std::wstring> ListArchiveMembers(const std::filesystem::path& archive, HMODULE ttpcomm) {
-    struct Context { std::vector<std::wstring> names; std::exception_ptr error; } context;
+std::vector<unsigned char> ReadArchiveSidecarCover(const std::filesystem::path& media,
+    HMODULE module, const std::function<bool()>& canceled) {
+    ArchiveMemberPath member;
+    if (!ParseArchiveMemberPath(media.native(),member)) return {};
+    try {
+        const auto names = ListArchiveMembers(member.archive,module,canceled);
+        const std::filesystem::path file(member.member);
+        for (const auto& stem : {file.stem().native(),std::wstring(L"cover"),std::wstring(L"folder"),std::wstring(L"front")}) {
+            for (const auto* extension : {L".png",L".jpg",L".jpeg",L".bmp",L".gif"}) {
+                if (canceled && canceled()) return {};
+                const auto wanted = (file.parent_path() / (stem + extension)).native();
+                const auto found = std::find_if(names.begin(),names.end(),[&](const auto& n){return !_wcsicmp(n.c_str(),wanted.c_str());});
+                if (found == names.end()) continue;
+                try {
+                    auto bytes = ReadArchiveMember({member.archive,*found,member.kind},module,canceled);
+                    const bool png = bytes.size() >= 24 && !memcmp(bytes.data(),"\x89PNG\r\n\x1a\n",8);
+                    const bool jpg = bytes.size() >= 4 && bytes[0]==0xff && bytes[1]==0xd8 && bytes[2]==0xff;
+                    const bool bmp = bytes.size() >= 26 && bytes[0]=='B' && bytes[1]=='M';
+                    const bool gif = bytes.size() >= 13 && (!memcmp(bytes.data(),"GIF87a",6) || !memcmp(bytes.data(),"GIF89a",6));
+                    if (png || jpg || bmp || gif) return bytes;
+                } catch (...) { if(canceled && canceled())return {}; }
+            }
+        }
+    } catch (...) {}
+    return {};
+}
+
+std::vector<std::wstring> ListArchiveMembers(const std::filesystem::path& archive, HMODULE ttpcomm,
+    const std::function<bool()>& canceled, const std::function<void(uint64_t,uint64_t)>& progress,
+    std::filesystem::path* resolved_archive) {
+    std::filesystem::path resolved=archive;
+    struct Context {
+        std::vector<std::wstring> names; std::exception_ptr error;
+        const std::function<bool()>& canceled;
+        const std::function<void(uint64_t,uint64_t)>& progress;
+    } context{{},{},canceled,progress};
     const auto visitor=[](void* opaque,const TtpCommArchiveEntry* entry)->BOOL {
         auto& out=*static_cast<Context*>(opaque);
         try {
-            if(!(entry->flags&(TTPCOMM_ARCHIVE_DIRECTORY|TTPCOMM_ARCHIVE_LINK))) out.names.emplace_back(entry->name);
+            if(out.canceled && out.canceled())return FALSE;
+            if(!(entry->flags&(TTPCOMM_ARCHIVE_DIRECTORY|TTPCOMM_ARCHIVE_LINK|TTPCOMM_ARCHIVE_SPARSE))) out.names.emplace_back(entry->name);
             return TRUE;
         } catch(...) { out.error=std::current_exception(); return FALSE; }
     };
     const auto api=ArchiveApi(ttpcomm);
-    const HRESULT result=api.enumerate(archive.c_str(),nullptr,visitor,&context);
+    const auto group=GroupApi(ttpcomm);auto volumes=ArchiveVolumeOptions(&canceled);
+    const HRESULT result=WithArchivePassword(archive,[&](const wchar_t* password) {
+        context.names.clear();context.error={};
+        TtpCommArchiveOptions options{};options.size=sizeof(options);options.password=password;
+        options.context=&context;
+        options.progress=[](void* opaque,uint64_t completed,uint64_t total)->BOOL {
+            auto& c=*static_cast<Context*>(opaque);
+            try {
+                if(c.canceled && c.canceled())return FALSE;
+                if(c.progress)c.progress(completed,total);
+                return TRUE;
+            }catch(...){c.error=std::current_exception();return FALSE;}
+        };
+        if(resolved_archive && group.volumes && ttpcomm::archive_format::Detect(archive.c_str())==ttpcomm::archive_format::Kind::rar){
+            std::vector<std::wstring> actual;
+            const auto hr=group.volumes(archive.c_str(),&options,&volumes,[](void* p,const wchar_t* name)->BOOL{
+                try{static_cast<std::vector<std::wstring>*>(p)->emplace_back(name);return TRUE;}catch(...){return FALSE;}
+            },&actual);
+            if(FAILED(hr))return hr;if(!actual.empty())resolved=actual.front();
+        }
+        return group.enumerate?group.enumerate(archive.c_str(),&options,&volumes,visitor,&context)
+            :api.enumerate(archive.c_str(),&options,visitor,&context);
+    },canceled);
     if(context.error) std::rethrow_exception(context.error);
-    if(FAILED(result)) throw ArchiveError(result);
+    if(FAILED(result)){if(result!=TTPCOMM_ARCHIVE_PASSWORD && result!=TTPCOMM_ARCHIVE_BAD_PASSWORD)DiscardArchiveVolumes(archive);throw ArchiveError(result);}
+    if(resolved_archive){AliasArchiveSession(archive,resolved);*resolved_archive=std::move(resolved);}
     // 00473338 and 00474051 retain the archive's order. Never alphabetize here.
     return std::move(context.names);
 }

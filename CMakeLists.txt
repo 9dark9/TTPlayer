@@ -75,6 +75,8 @@ add_library(ttplayer_core
   src/app/file_info_worker.cpp
   src/app/output_device_worker.cpp
   src/audio/archive_member.cpp
+  src/audio/archive_password.cpp
+  src/ui/archive_password_dialog.cpp
   src/audio/asio_sink.cpp
   src/audio/audio_engine.cpp
   src/audio/http_stream.cpp
@@ -179,7 +181,7 @@ target_compile_definitions(ttplayer_core PRIVATE UNICODE _UNICODE NOMINMAX WIN32
 target_compile_options(ttplayer_core PRIVATE /W4 /permissive- /EHsc /utf-8)
 target_link_libraries(ttplayer_core PUBLIC
   ttplayer_wtl_headers
-  advapi32 winmm ole32 oleaut32 comsuppw uuid strmiids msimg32 shell32 shlwapi comctl32 comdlg32
+  advapi32 crypt32 winmm ole32 oleaut32 comsuppw uuid strmiids msimg32 shell32 shlwapi comctl32 comdlg32
   windowscodecs gdiplus dsound setupapi dwmapi uxtheme
   mfplat mfreadwrite mfuuid propsys winhttp wininet
 )

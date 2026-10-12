@@ -80,6 +80,7 @@ constexpr UINT_PTR kNaturalPlayTimer = 0x21b;
 constexpr UINT kMsgDiscLookup = WM_APP + 0x39e;
 constexpr UINT kMsgPlaylistInfoReady = WM_APP + 0x313;
 constexpr UINT kMsgExtensionCorrection = WM_APP + 0x316;
+constexpr UINT kMsgDeferredFileImport = WM_APP + 0x37c;
 // A directory walk never calls back into PlayerWindow.  Its immutable result
 // is handed to the UI thread with this message and discarded when a newer
 // refresh generation has superseded it.

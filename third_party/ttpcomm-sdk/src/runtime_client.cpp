@@ -3,6 +3,26 @@
 #include <cwchar>
 
 namespace ttpcomm::host {
+bool QueryArchiveGroups(HMODULE module,TtpCommArchiveGroupApi& api) noexcept {
+    api={};api.size=sizeof(api);
+    const auto query=module?reinterpret_cast<TtpCommQueryArchiveGroupFn>(GetProcAddress(module,"ttpcomm_query_archive_stream")):nullptr;
+    if(!query)return false;
+    __try{return query(TTPCOMM_ARCHIVE_GROUP_ABI,&api) && api.size>=sizeof(api) && api.abi_version==TTPCOMM_ARCHIVE_GROUP_ABI &&
+        (api.capabilities&TTPCOMM_ARCHIVE_GROUP_REQUIRED)==TTPCOMM_ARCHIVE_GROUP_REQUIRED && api.enumerate && api.open_member && api.volumes && api.status && api.clear_cache;
+    }__except(EXCEPTION_EXECUTE_HANDLER){api={};return false;}
+}
+const TtpCommArchiveGroupApi* ArchiveGroups() noexcept {
+    struct State {
+        HMODULE module{};TtpCommArchiveGroupApi api{};
+        State() noexcept {
+            if(!GetModuleHandleExW(0,L"ttpcomm.dll",&module)){
+                if(!ArchiveStreams() || !GetModuleHandleExW(0,L"ttpcomm.dll",&module))return;
+            }
+            if(!QueryArchiveGroups(module,api)){FreeLibrary(module);module=nullptr;}
+        }
+    };
+    static const State state;return state.module?&state.api:nullptr;
+}
 bool QueryArchiveStreams(HMODULE module,TtpCommArchiveStreamApi& api) noexcept {
     api={};api.size=sizeof(api);
     const auto query=module ? reinterpret_cast<TtpCommQueryArchiveStreamFn>(GetProcAddress(module,"ttpcomm_query_archive_stream")) : nullptr;
