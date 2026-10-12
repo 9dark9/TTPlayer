@@ -4633,6 +4633,7 @@ void PlayerWindow::PaintPlaylist(HDC dc) const {
 
 void PlayerWindow::PreparePlaylistMenu(HMENU menu) const {
     if (!menu) return;
+    PopulatePlaylistSwitchMenu(menu);
     const bool has_tracks = VisiblePlaylistTrackCount() != 0;
     const bool has_selection = !playlist_selected_rows_.empty();
     const playlist::Track* focused_track = nullptr;
@@ -4745,6 +4746,52 @@ void PlayerWindow::PreparePlaylistMenu(HMENU menu) const {
     // per-command audit in PLAYLIST_MARQUEE_MENU_AUDIT.md.
 }
 
+void PlayerWindow::PopulatePlaylistSwitchMenu(HMENU menu) const {
+    const HMENU lists = FindCommandMenu(menu, kPlaylistAddList);
+    if (!lists) return;
+
+    MENUITEMINFOW item{sizeof(item)};
+    item.fMask = MIIM_SUBMENU;
+    HMENU choices = GetMenuItemInfoW(lists, kPlaylistSwitchMenu, FALSE, &item)
+        ? item.hSubMenu : nullptr;
+    if (!choices) {
+        choices = CreatePopupMenu();
+        if (!choices) return;
+        item.fMask = MIIM_ID | MIIM_STRING | MIIM_SUBMENU;
+        item.wID = kPlaylistSwitchMenu;
+        item.dwTypeData = const_cast<wchar_t*>(L"切换列表");
+        item.hSubMenu = choices;
+        int position = 0;
+        const int count = GetMenuItemCount(lists);
+        while (position < count && GetMenuItemID(lists, position) != kPlaylistAddList)
+            ++position;
+        if (!InsertMenuItemW(lists, position + 1, TRUE, &item)) {
+            DestroyMenu(choices);
+            return;
+        }
+    } else {
+        while (GetMenuItemCount(choices) > 0)
+            DeleteMenu(choices, 0, MF_BYPOSITION);
+    }
+
+    for (const auto& entry : playlists_.Entries()) {
+        if (entry.slot > kPlaylistSwitchLast - kPlaylistSwitchFirst) continue;
+        std::wstring label;
+        for (const wchar_t ch : entry.playlist.Title()) {
+            label += ch;
+            if (ch == L'&') label += L'&';
+        }
+        const UINT command = kPlaylistSwitchFirst + static_cast<UINT>(entry.slot);
+        AppendMenuW(choices, MF_STRING, command, label.c_str());
+        if (entry.slot == playlists_.ActiveSlot())
+            CheckMenuRadioItem(choices, command, command, command, MF_BYCOMMAND);
+    }
+    item.fMask = MIIM_STATE;
+    item.fState = GetMenuItemCount(choices) > 0 && !settings_.playlist.library_mode
+        ? MFS_ENABLED : MFS_DISABLED;
+    SetMenuItemInfoW(lists, kPlaylistSwitchMenu, FALSE, &item);
+}
+
 void PlayerWindow::PreparePlaylistModeMenu(HMENU menu) const {
     UINT checked = kPlaylistModeSequential;
     if (settings_.player.play_mode == 0) checked = kPlaylistModeSingle;
@@ -4798,8 +4845,12 @@ void PlayerWindow::PopulatePlaylistSendToMenu(HMENU menu) {
 }
 
 HMENU PlayerWindow::CreatePlaylistFilesMenu(std::optional<size_t> row) const {
-    if (!row) return ConvertMenuBarToPopup(i18n::LoadMenu(ResourceModule(),
-        MAKEINTRESOURCEW(kMenuPlaylistToolbar)));
+    if (!row) {
+        HMENU menu = ConvertMenuBarToPopup(i18n::LoadMenu(ResourceModule(),
+            MAKEINTRESOURCEW(kMenuPlaylistToolbar)));
+        PopulatePlaylistSwitchMenu(menu);
+        return menu;
+    }
     const UINT resource = playlist_selected_rows_.size() > 1
         ? kMenuPlaylistItems : kMenuPlaylistItem;
     HMENU menu = DetachFirstPopup(i18n::LoadMenu(ResourceModule(), MAKEINTRESOURCEW(resource)));
@@ -5792,6 +5843,15 @@ void PlayerWindow::ReorderSelectedPlaylistRows(size_t insertion,bool copy) {
 }
 
 bool PlayerWindow::HandlePlaylistCommand(UINT command) {
+    if (command >= kPlaylistSwitchFirst && command <= kPlaylistSwitchLast) {
+        if (!settings_.playlist.library_mode) {
+            // A background import or catalogue reorder must not redirect an
+            // already-open menu to a different playlist at the same row.
+            if (const auto index = playlists_.IndexOfSlot(command - kPlaylistSwitchFirst))
+                SwitchPlaylist(*index);
+        }
+        return true;
+    }
     if (settings_.playlist.library_mode &&
         HandleMediaLibraryCommand(command)) return true;
     if (command >= kPlaylistSendToFirst &&

@@ -333,6 +333,10 @@ constexpr UINT kPlaylistAddList = 0x7f03;
 constexpr UINT kPlaylistRenameList = 0x7f04;
 constexpr UINT kPlaylistActivateList = 0x7f05;
 constexpr UINT kPlaylistSaveAllLists = 0x7f06;
+constexpr UINT kPlaylistSwitchMenu = 0xb700;
+// Stable numbered playlist slots, separate from track/skin/provider commands.
+constexpr UINT kPlaylistSwitchFirst = 0xc000;
+constexpr UINT kPlaylistSwitchLast = 0xdfff;
 constexpr UINT kPlaylistAddFile = 0x7f09;
 constexpr UINT kPlaylistAddFolder = 0x7f0a;
 constexpr UINT kPlaylistLocalSearch = 0x7f0b;
