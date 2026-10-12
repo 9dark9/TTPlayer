@@ -98,6 +98,16 @@ public:
 
 private:
     void DiscoverSkinPlugins();
+    struct SkinRebindScope {
+        explicit SkinRebindScope(PlayerWindow& owner);
+        ~SkinRebindScope();
+        SkinRebindScope(const SkinRebindScope&) = delete;
+        SkinRebindScope& operator=(const SkinRebindScope&) = delete;
+        PlayerWindow& owner;
+        bool resume, previous;
+    };
+    bool DeferSkinRebindPaint(HWND window, UINT message) const;
+    bool skin_rebinding_{};
     bool IsPluginSkinPackage(const std::filesystem::path& path);
     bool LoadPluginSkin(const std::filesystem::path& path, bool restore_profile = true);
     [[nodiscard]] const std::wstring& ActiveSkinSelector() const;

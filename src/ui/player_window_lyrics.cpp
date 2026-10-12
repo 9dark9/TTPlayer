@@ -409,6 +409,7 @@ bool PlayerWindow::HandleLyricDoubleClick(HWND origin) {
 
 LRESULT PlayerWindow::HandleLyricControlMessage(HWND control, UINT message,
                                                 WPARAM wparam, LPARAM lparam, bool content_surface) {
+    if(DeferSkinRebindPaint(control,message)) return message==WM_ERASEBKGND;
     if(control==lyric_control_ && !content_surface && NativeLyricContentActive()) {
         // Re-enter only for the lyric portion, using the same hit testing and
         // drag/capture rules as WSZ/WAL content. Layout uses parent coordinates
@@ -677,6 +678,7 @@ LRESULT PlayerWindow::HandleLyricControlMessage(HWND control, UINT message,
 
 LRESULT PlayerWindow::HandleLyricMessage(UINT message, WPARAM wparam,
                                          LPARAM lparam) {
+    if(DeferSkinRebindPaint(lyric_window_,message)) return message==WM_ERASEBKGND;
     static const UINT find_message = RegisterWindowMessageW(FINDMSGSTRINGW);
     if (message == find_message) {
         if (const auto* request =
@@ -2955,7 +2957,12 @@ bool PlayerWindow::EnterLyricEditor() {
 }
 
 void PlayerWindow::LayoutLyricEditor(const RECT* content_bounds) {
-    if (!lyric_editor_ && !lyric_editor_toolbar_) return;
+    // The toolbar is cached after LeaveLyricEditor. Resize/skin/content-mode
+    // layout must not resurrect it when its RichEdit document is closed.
+    if (!lyric_editor_) {
+        if (lyric_editor_toolbar_) ShowWindow(lyric_editor_toolbar_, SW_HIDE);
+        return;
+    }
     const HWND editor_parent=LyricEditorParent();
     for(HWND child:{lyric_editor_,lyric_editor_toolbar_})
         if(child && GetParent(child)!=editor_parent)SetParent(child,editor_parent);

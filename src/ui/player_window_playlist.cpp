@@ -1544,6 +1544,7 @@ int PlayerWindow::FindPlaylistControlPrefix(
 LRESULT PlayerWindow::HandlePlaylistControlMessage(HWND control, UINT message,
                                                     WPARAM wparam,
                                                     LPARAM lparam) {
+    if(DeferSkinRebindPaint(control,message)) return message==WM_ERASEBKGND;
     const HWND parent = GetParent(control);
     const int identifier = GetDlgCtrlID(control);
     const bool catalogue = identifier == kPlaylistListId;
@@ -1875,6 +1876,7 @@ LRESULT PlayerWindow::HandlePlaylistControlMessage(HWND control, UINT message,
 
 LRESULT PlayerWindow::HandlePlaylistMessage(UINT message, WPARAM wparam,
                                            LPARAM lparam, HWND mouse_source) {
+    if(DeferSkinRebindPaint(playlist_window_,message)) return message==WM_ERASEBKGND;
     const auto geometry = [this]() {
         RECT client{};
         if (playlist_window_) GetClientRect(playlist_window_, &client);

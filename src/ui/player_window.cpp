@@ -2487,6 +2487,7 @@ bool PlayerWindow::LoadSkin(skin::SkinPackage package,
     // DeskLrcBar owns borrowed HBITMAP pointers from LegacySkin. Detach them
     // before optional::emplace destroys the package object, then rebind only
     // after the replacement has passed ApplyLoadedSkin's region validation.
+    SkinRebindScope rebind(*this);
     auto previous_external = std::move(external_skin_);
     if (previous_external) previous_external->Detach();
     desktop_lyrics_.SetSkin(nullptr);
@@ -2539,6 +2540,7 @@ bool PlayerWindow::LoadSkin(skin::SkinPackage package,
         external_skin_ = std::move(previous_external);
         if (external_skin_)
             external_skin_->Attach(window_, playlist_window_, equalizer_window_, lyric_window_);
+        UpdateVisualWindowLayout();UpdateVisualFrame();
         RemovePluginSkinNativeTips();
         return false;
     }
@@ -2886,6 +2888,7 @@ LRESULT CALLBACK PlayerWindow::PlaybackTipWindowProc(
 }
 
 LRESULT PlayerWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
+    if(DeferSkinRebindPaint(window_,message)) return message==WM_ERASEBKGND;
     if (message == audio::kWinampDspMovingMessage) {
         const auto option = DecodePackedRuntimeOption(settings_.general.snap_windows, 1, 100);
         const HWND source = reinterpret_cast<HWND>(wparam);
@@ -6946,13 +6949,13 @@ void PlayerWindow::DrawButton(const DRAWITEMSTRUCT& item) const {
 void PlayerWindow::RefreshPlaylist() {
     CancelPlaylistMarquee(true);
     if (playlist_view_) {
-        SendMessageW(playlist_view_, WM_SETREDRAW, FALSE, 0);
+        ScopedSkinRedraw redraw(playlist_view_);
         SendMessageW(playlist_view_, LB_RESETCONTENT, 0, 0);
         for (const auto& track : ActivePlaylist().Tracks()) {
             const auto name = DisplayName(track);
             SendMessageW(playlist_view_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name.c_str()));
         }
-        SendMessageW(playlist_view_, WM_SETREDRAW, TRUE, 0);
+        redraw.Resume();
         InvalidateRect(playlist_view_, nullptr, TRUE);
     }
     if (playlist_window_) {

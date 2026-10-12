@@ -44,6 +44,7 @@ std::vector<skin::SkinLayer> EqualizerLayers(const skin::EqualizerSkin& layout) 
 LRESULT PlayerWindow::HandleEqualizerControlMessage(HWND control, UINT message,
                                                      WPARAM wparam,
                                                      LPARAM lparam) {
+    if(DeferSkinRebindPaint(control,message)) return message==WM_ERASEBKGND;
     const HWND parent = GetParent(control);
     const auto item = std::find_if(equalizer_controls_.begin(), equalizer_controls_.end(),
         [control](const auto& value) { return value.second == control; });
@@ -130,6 +131,7 @@ LRESULT PlayerWindow::HandleEqualizerControlMessage(HWND control, UINT message,
 
 LRESULT PlayerWindow::HandleEqualizerMessage(UINT message, WPARAM wparam,
                                               LPARAM lparam) {
+    if(DeferSkinRebindPaint(equalizer_window_,message)) return message==WM_ERASEBKGND;
     if (HandleEqualizerSliderMessage(message, wparam, lparam)) return 0;
     const auto is_slider = [](int hit) {
         return hit == kEqSliderBalance || hit == kEqSliderSurround ||

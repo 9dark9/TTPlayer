@@ -12,6 +12,27 @@
 
 namespace ttplayer::ui {
 using namespace detail;
+PlayerWindow::SkinRebindScope::SkinRebindScope(PlayerWindow& player)
+    : owner(player), resume(player.visual_worker_.joinable()), previous(player.skin_rebinding_) {
+    // The worker paints directly into child DCs. Finish its current frame
+    // before Detach restores the HWNDs or releases borrowed skin bitmaps.
+    if(resume) owner.StopVisualWorker();
+    owner.skin_rebinding_=true;
+}
+PlayerWindow::SkinRebindScope::~SkinRebindScope() {
+    owner.skin_rebinding_=previous;
+    if(!previous) for(HWND window:{owner.window_,owner.playlist_window_,owner.equalizer_window_,owner.lyric_window_})
+        if(IsWindow(window)) RedrawWindow(window,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_FRAME|RDW_ALLCHILDREN);
+    if(resume && owner.window_ && IsWindow(owner.window_)) owner.StartVisualWorker();
+}
+bool PlayerWindow::DeferSkinRebindPaint(HWND window,UINT message) const {
+    if(!skin_rebinding_) return false;
+    // WM_SETREDRAW clears WS_VISIBLE, which interferes with owned-window
+    // placement/visibility during a rebind. Keep those states live, but don't
+    // present the intermediate old-child/new-background combinations.
+    if(message==WM_PAINT) {ValidateRect(window,nullptr);return true;}
+    return message==WM_ERASEBKGND || message==WM_PRINTCLIENT;
+}
 void PlayerWindow::DiscoverSkinPlugins() {
     if(skin_plugins_discovered_) return;
     skin_plugins_discovered_=true;
@@ -115,6 +136,7 @@ bool PlayerWindow::LoadPluginSkin(const std::filesystem::path& path, bool restor
             // rectangles or prevent loading the skin itself.
             layout.state[0]=0;static_cast<void>(next->Layout(layout,true));
         }
+        SkinRebindScope rebind(*this);
         auto previous=std::move(external_skin_);
         if(previous) previous->Detach();
         if (window_) {
@@ -127,7 +149,9 @@ bool PlayerWindow::LoadPluginSkin(const std::filesystem::path& path, bool restor
             settings_.lyric=previous_lyric;settings_.visual=previous_visual;
             ApplySkinProfileWindowState();
             if(previous) previous->Attach(window_,playlist_window_,equalizer_window_,lyric_window_);
-            external_skin_=std::move(previous);RemovePluginSkinNativeTips();return false;
+            external_skin_=std::move(previous);
+            UpdateVisualWindowLayout();UpdateVisualFrame();
+            RemovePluginSkinNativeTips();return false;
         }
         external_skin_=std::move(next);
         RebuildLyricFont(false);
@@ -662,7 +686,7 @@ void PlayerWindow::HandleSkinPluginCommand(uint32_t command,int32_t value) {
     case TTP_SKIN_OPTIONS: ShowOptions();break;
     case TTP_SKIN_VOLUME:
         {const int previous=settings_.player.volume;SetPlaybackVolume(value);
-         if(previous!=settings_.player.volume)SetVolumeTrackingStatus(true);}
+         if(previous!=settings_.player.volume || external_skin_->VolumeTracking())SetVolumeTrackingStatus(true);}
         break;
     case TTP_SKIN_VOLUME_DELTA: AdjustPlaybackVolume(std::clamp(value,-100,100));break;
     case TTP_SKIN_VOLUME_END: SetVolumeTrackingStatus(false);break;
