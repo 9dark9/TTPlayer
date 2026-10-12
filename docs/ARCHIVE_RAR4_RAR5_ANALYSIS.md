@@ -1,6 +1,10 @@
 # 原版 ZIP／RAR、拖放流程与重建版 RAR5 支持分析
 
+> 2026-10-12 修复完成：成员名、CUE 路径、共享缓存与后台取消已补齐；原版实际函数和 XP／Win7 对照结果见 [实施记录](ARCHIVE_CUE_RECOVERY_20261012.md)。原版 RAR 位于 EXE；重建版 RAR 和音乐 ZIP 位于 `ttpcomm.dll`。以下历史分析中的旧后端问题应结合实施记录阅读。
+
 > 后续实现状态（2026-10-11）：本文保留修复前的分析基线。RAR 后端已改为重建 `ttpcomm.dll` 中的 UnRAR 引擎，并完成 XP／Win7 验证；当前行为、测试结果和剩余边界见 [归档引擎实施记录](ARCHIVE_ENGINE_IMPLEMENTATION.md)。本地 `backend_results.json` 已更新为新后端结果，不能再用它代表旧 Shell 后端。
+
+> 补充核对（2026-10-12）：原版音乐 ZIP 的虚表读取走 `0041F061`／`0041F185`，与本文第 3.1 节引用的皮肤一次性读取 `0041F422`／`0041F481` 不同。第 3.1 节不能作为原版音乐对 Stored 等方法完整支持的证据。当前包内 CUE、成员匹配、缓存和取消差异见 [新的原版对照审计](ARCHIVE_CUE_ORIGINAL_PARITY_AUDIT_20261012.md)。
 
 日期：2026-10-11。重建版核对版本：`e34ec60`。原版基准：本仓库根目录 `TTPlayer.exe` 与 `reverse/decompiled/TTPlayer.exe.pseudo.c`，即当前项目使用的 5.7.9 基准。
 

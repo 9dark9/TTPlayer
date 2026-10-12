@@ -1,4 +1,4 @@
-#include <ttpcomm/client.h>
+﻿#include <ttpcomm/client.h>
 #include <ttpcomm/runtime_pcm.h>
 #include "ttplayer/platform/optional_windows_api.h"
 #include "ttplayer/audio/audio_engine.h"
@@ -1091,14 +1091,26 @@ public:
         metadata_override_ = false;
         ArchiveMemberPath member;
         const bool archive = ParseArchiveMemberPath(path.native(), member);
+        archive_stream_.Reset();
+        if(archive) {
+            try { archive_stream_.Attach(OpenArchiveMemberStream(member,comm_,options.network_canceled)); }
+            catch(const ArchiveError& e){error_=e.Message();result_=e.Result();return false;}
+        }
         std::wstring hint = AudioExtensionHint(path);
         if (!archive) {
             result_ = ProbeAudioFormatHint(path, hint);
             if (FAILED(result_)) { error_ = HResultMessage(L"Open media file", result_); return false; }
         }
         const auto attempt = [&](std::unique_ptr<DecodedAudioSource> candidate, bool builtin_tags) {
+            if(archive_stream_) {
+                LARGE_INTEGER zero{};result_=archive_stream_->Seek(zero,STREAM_SEEK_SET,nullptr);
+                if(FAILED(result_)){error_=ArchiveError(result_).Message();return false;}
+            }
             if (!candidate->Open(path, options)) {
                 error_ = candidate->Error(); result_ = candidate->ErrorResult();
+                HRESULT archive_result{};
+                if(archive_stream_)(void)ArchiveMemberProgress(archive_stream_.Get(),comm_,&archive_result);
+                if(FAILED(archive_result)){result_=archive_result;error_=ArchiveError(result_).Message();}
                 return false;
             }
             source_ = std::move(candidate);
@@ -1126,17 +1138,17 @@ public:
             result_ = S_OK; error_.clear(); return true;
         };
         if (manager_) {
-            if (attempt(std::make_unique<LegacyPluginSource>(*manager_, comm_), false)) return true;
+            if (attempt(std::make_unique<LegacyPluginSource>(*manager_, comm_,archive_stream_.Get()), false)) return true;
             if (IsTerminalAudioOpenError(result_)) return false;
         }
         if (hint == L".wav" || hint == L".wave" || hint == L".aif" ||
             hint == L".aiff" || hint == L".aifc" || hint == L".au" || hint == L".snd") {
-            if (attempt(std::make_unique<PcmFileSource>(comm_), false)) return true;
+            if (attempt(std::make_unique<PcmFileSource>(comm_,archive_stream_.Get()), false)) return true;
             if (IsTerminalAudioOpenError(result_)) return false;
         }
         const auto system_source = [&]() -> std::unique_ptr<DecodedAudioSource> {
-            if (platform::HasMediaFoundation()) return std::make_unique<MediaFoundationSource>(comm_);
-            return CreateLegacyWindowsSource(comm_);
+            if (platform::HasMediaFoundation()) return std::make_unique<MediaFoundationSource>(comm_,archive_stream_.Get());
+            return CreateLegacyWindowsSource(comm_,archive_stream_.Get());
         };
         const bool mpeg = hint == L".mp3" || hint == L".mp2" || hint == L".mp1" ||
                           hint == L".mpa" || hint == L".mp3pro";
@@ -1155,10 +1167,23 @@ public:
         return !mpeg && attempt(system_source(), true);
     }
     bool Read(size_t count, std::vector<std::byte>& out, bool& end) override {
-        return source_ && source_->Read(count, out, end);
+        const bool ok=source_ && source_->Read(count,out,end);
+        if(!CheckArchive()){out.clear();end=false;return false;}
+        if(ok && end && archive_stream_) {
+            // Decoders can stop before container tail tags. Do not turn a late
+            // decompression/CRC failure into successful EOF.
+            LARGE_INTEGER zero{};ULARGE_INTEGER saved{};unsigned char byte{};ULONG got{};
+            HRESULT hr=archive_stream_->Seek(zero,STREAM_SEEK_CUR,&saved);
+            if(SUCCEEDED(hr))hr=archive_stream_->Seek(zero,STREAM_SEEK_END,nullptr);
+            if(SUCCEEDED(hr))hr=archive_stream_->Read(&byte,1,&got);
+            LARGE_INTEGER restore{};restore.QuadPart=static_cast<LONGLONG>(saved.QuadPart);
+            archive_stream_->Seek(restore,STREAM_SEEK_SET,nullptr);
+            if(FAILED(hr)){result_=hr;error_=ArchiveError(hr).Message();out.clear();end=false;return false;}
+        }
+        return ok;
     }
     bool Seek(std::chrono::milliseconds position) override {
-        return source_ && source_->Seek(position);
+        const bool ok=source_ && source_->Seek(position);return CheckArchive() && ok;
     }
     std::optional<std::chrono::milliseconds> LastSeekPosition() const override {
         return source_ ? source_->LastSeekPosition() : std::nullopt;
@@ -1171,13 +1196,19 @@ public:
     }
     AudioFormat DisplayFormat() const override { return source_ ? source_->DisplayFormat() : AudioFormat{}; }
     std::chrono::milliseconds Duration() const override { return source_ ? source_->Duration() : std::chrono::milliseconds{}; }
-    std::wstring Error() const override { return source_ ? source_->Error() : error_; }
-    HRESULT ErrorResult() const override { return source_ ? source_->ErrorResult() : result_; }
+    int DownloadedPercent() override {return archive_stream_?ArchiveMemberProgress(archive_stream_.Get(),comm_):source_?source_->DownloadedPercent():-1;}
+    std::wstring Error() const override { return !error_.empty() ? error_ : source_ ? source_->Error() : error_; }
+    HRESULT ErrorResult() const override { return FAILED(result_) ? result_ : source_ ? source_->ErrorResult() : result_; }
     AudioMetadata Metadata() const override {
         return source_ && !metadata_override_ ? source_->Metadata() : metadata_;
     }
 private:
+    bool CheckArchive() {
+        HRESULT hr{};if(archive_stream_)(void)ArchiveMemberProgress(archive_stream_.Get(),comm_,&hr);
+        if(FAILED(hr)){result_=hr;error_=ArchiveError(hr).Message();return false;}return true;
+    }
     const plugins::PluginManager* manager_{}; HMODULE comm_{};
+    ComPtr<IStream> archive_stream_;
     std::unique_ptr<DecodedAudioSource> source_;
     AudioMetadata metadata_;
     bool metadata_override_{};
@@ -1305,10 +1336,12 @@ public:
             ArchiveMemberPath member;
             if (ParseArchiveMemberPath(path.native(), member)) {
                 sheet_ = CueSheet::LoadFromMemory(
-                    ReadArchiveMember(member, ttpcomm_), path);
+                    ReadArchiveMember(member, ttpcomm_,options.network_canceled), path);
             } else {
                 sheet_ = CueSheet::Load(path);
             }
+        } catch (const ArchiveError& error) {
+            error_=error.Message();archive_error_=error.Result();return false;
         } catch (const std::exception&) {
             error_ = L"Unable to parse the CUE sheet";
             return false;
@@ -1477,6 +1510,9 @@ public:
     [[nodiscard]] std::wstring Error() const override { return error_; }
     [[nodiscard]] AudioMetadata Metadata() const override { return metadata_; }
 
+    int DownloadedPercent() override { return inner_ ? inner_->DownloadedPercent() : -1; }
+    HRESULT ErrorResult() const override { return FAILED(archive_error_) ? archive_error_ : inner_ ? inner_->ErrorResult() : E_FAIL; }
+
 private:
     bool FramesToBytes(std::uint64_t frames, std::uint64_t& bytes) const {
         if (frames > std::numeric_limits<std::uint64_t>::max() /
@@ -1565,6 +1601,7 @@ private:
     const plugins::PluginManager* manager_{};
     HMODULE ttpcomm_{};
     int subtrack_{};
+    HRESULT archive_error_{S_OK};
     std::optional<CueSheet> sheet_;
     CueTrack track_;
     std::unique_ptr<DecodedAudioSource> inner_;

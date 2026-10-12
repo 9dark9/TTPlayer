@@ -1,4 +1,4 @@
-#include "ttplayer/audio/disc_media.h"
+﻿#include "ttplayer/audio/disc_media.h"
 #include "ttplayer/i18n/i18n.h"
 #include "ttplayer/ui/wtl_dialogs.h"
 #include "ttplayer/ui/player_window.h"
@@ -968,75 +968,15 @@ bool PlayerWindow::CollectImportedTracks(const std::filesystem::path& input,
             return false;
         }
     }
-    if (extension == L".zip") {
-        // FUN_00474051 preserves ordinary members as archive.zip|member and
-        // extracts them only when the sound source is opened.  Do not reuse
-        // the skin cache extraction path here: persisted playlists must not
-        // depend on files under %TEMP%.
-        try {
-            const auto package = skin::SkinPackage::Open(path);
-            const size_t before = tracks.size();
-            for (const auto& entry : package.Entries()) {
-                std::wstring member;
-                try { member = audio::DecodeZipMemberName(entry.name); }
-                catch (const std::exception&) { continue; }
-                if (member.empty() || member.back() == L'\\') continue;
-                const auto logical = audio::MakeZipMemberPath(path, member);
-                const auto member_extension = LowerExtension(logical);
-                if (member_extension == L".cue") {
-                    // 00474051 calls the archive read vtable at +0x14 and
-                    // passes both those bytes and `archive|member` to
-                    // 00473EC5.  Playlist rows retain the logical CUE name;
-                    // CueSegmentSource repeats the same memory parse when a
-                    // sub-track is opened.
-                    try {
-                        const auto sheet = audio::CueSheet::LoadFromMemory(
-                            package.ReadEntry(entry.name, ttpcomm_module_), logical);
-                        for (const auto& cue_track : sheet.Tracks()) {
-                            tracks.push_back({
-                                logical,
-                                core::WideToUtf8(cue_track.title), core::WideToUtf8(cue_track.performer), -2,
-                                cue_track.number, core::WideToUtf8(sheet.Title())});
-                            tracks.back().track_number = cue_track.number;
-                            for (const auto& [key, value] : cue_track.metadata)
-                                tracks.back().metadata.emplace_back(core::WideToUtf8(key), core::WideToUtf8(value));
-                        }
-                    } catch (const std::exception&) {
-                        // Like 00474051, a malformed individual CUE member
-                        // does not abort enumeration of the remaining archive.
-                    }
-                    continue;
-                }
-                // CDA and MIDI use device/file-name backends in the rebuild;
-                // they cannot consume the archive IStream boundary.
-                if (member_extension == L".cda" || member_extension == L".mid" ||
-                    member_extension == L".midi" || member_extension == L".rmi")
-                    continue;
-                bool supported = IsBuiltInAudioPath(logical);
-                if (!supported) {
-                    supported = std::ranges::any_of(reader_formats_,
-                        [&](const auto& format) {
-                            return PatternMatchesPath(format.pattern, logical);
-                        });
-                }
-                if (supported) {
-                    tracks.push_back(
-                        {logical, ImportedTrackTitle(logical), {}, -2});
-                }
-            }
-            return tracks.size() != before;
-        } catch (const std::exception&) {
-            return false;
-        }
-    }
-    if (extension == L".rar") {
+    if (extension == L".zip" || extension == L".rar") {
         // 004738B5 selects a distinct RAR archive object, but 00474051 keeps
         // the same archive|member identity. The rebuilt core enumerates headers
         // in archive order; payloads are only read for CUE or playback.
         try {
             const size_t before = tracks.size();
-            for (const auto& member : audio::ListRarArchiveMembers(path, ttpcomm_module_)) {
-                const auto logical = audio::MakeArchiveMemberPath(path, member);
+            std::wstring cue_read_error;
+            for (const auto& member : audio::ListArchiveMembers(path, ttpcomm_module_)) {
+                const auto logical = audio::MakeZipMemberPath(path, member);
                 const auto member_extension = LowerExtension(logical);
                 if (member_extension == L".cue") {
                     try {
@@ -1056,12 +996,19 @@ bool PlayerWindow::CollectImportedTracks(const std::filesystem::path& input,
                             for (const auto& [key, value] : cue_track.metadata)
                                 tracks.back().metadata.emplace_back(core::WideToUtf8(key), core::WideToUtf8(value));
                         }
+                    } catch (const audio::ArchiveError& error) {
+                        // Keep successfully imported members, but do not silently
+                        // hide a password/CRC/read failure in the CUE itself.
+                        if (cue_read_error.empty())
+                            cue_read_error = member + L"\n\n" + error.Message();
                     } catch (const std::exception&) {
                     }
                     continue;
                 }
                 if (member_extension == L".cda" || member_extension == L".mid" ||
                     member_extension == L".midi" || member_extension == L".rmi")
+                    // 004E9BF5 only opens MIDI by path; its stream Open/Read
+                    // return E_NOTIMPL. CDA similarly needs an actual CD drive.
                     continue;
                 bool supported = IsBuiltInAudioPath(logical);
                 if (!supported) {
@@ -1074,6 +1021,10 @@ bool PlayerWindow::CollectImportedTracks(const std::filesystem::path& input,
                     tracks.push_back(
                         {logical, ImportedTrackTitle(logical), {}, -2});
                 }
+            }
+            if (!cue_read_error.empty()) {
+                const auto message = path.filename().wstring() + L"\n" + cue_read_error;
+                MessageBoxW(window_, message.c_str(), L"读取压缩包", MB_OK | MB_ICONERROR);
             }
             return tracks.size() != before;
         } catch (const audio::ArchiveError& error) {

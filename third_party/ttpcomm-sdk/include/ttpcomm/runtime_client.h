@@ -11,4 +11,6 @@ const TtpCommRuntimeApi* Runtime() noexcept;
 bool QueryRuntime(HMODULE module, TtpCommRuntimeApi& api) noexcept;
 const TtpCommArchiveApi* Archive() noexcept;
 bool QueryArchive(HMODULE module, TtpCommArchiveApi& api) noexcept;
+const TtpCommArchiveStreamApi* ArchiveStreams() noexcept;
+bool QueryArchiveStreams(HMODULE module, TtpCommArchiveStreamApi& api) noexcept;
 }

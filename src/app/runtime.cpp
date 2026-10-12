@@ -171,11 +171,17 @@ bool TtpCommRuntime::Initialize() {
     if (api_.module) return true;
     const auto path = FindRuntimePath(L"ttpcomm.dll");
     if(path.empty() || !TtpComm_LoadApi(&api_, path.c_str())) return false;
-    TtpCommArchiveApi archive{};
-    if(!ttpcomm::host::Runtime() || !ttpcomm::host::QueryArchive(api_.module,archive)) {Shutdown();return false;}
+    TtpCommArchiveStreamApi archive{};
+    if(!ttpcomm::host::Runtime() || !ttpcomm::host::QueryArchiveStreams(api_.module,archive)) {Shutdown();return false;}
     return true;
 }
-void TtpCommRuntime::Shutdown() { if (api_.module) TtpComm_UnloadApi(&api_); }
+void TtpCommRuntime::Shutdown() {
+    if(api_.module) {
+        TtpCommArchiveStreamApi archive{};
+        if(ttpcomm::host::QueryArchiveStreams(api_.module,archive))archive.clear_cache();
+        TtpComm_UnloadApi(&api_);
+    }
+}
 
 ResourceRuntime::~ResourceRuntime() { Shutdown(); }
 bool ResourceRuntime::Initialize() {

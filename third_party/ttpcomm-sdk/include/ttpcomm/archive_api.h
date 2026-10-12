@@ -50,3 +50,38 @@ typedef struct TtpCommArchiveApi {
 } TtpCommArchiveApi;
 #pragma pack(pop)
 typedef BOOL (__cdecl *TtpCommQueryArchiveFn)(uint32_t abi, TtpCommArchiveApi*);
+
+/* ABI 2 is available at ttpcomm_query_archive_stream (ordinal 503), and at
+   ttpcomm_query_archive with ABI 2. ABI 1 stays synchronous and unchanged.
+   Each stream owns its cancellation callback. It must outlive that stream
+   and its clones; only caller threads poll it, never the cached producer.
+   Release all streams and call clear_cache before unloading the DLL. */
+#define TTPCOMM_ARCHIVE_STREAM_ABI 2u
+#define TTPCOMM_ARCHIVE_ZIP 4u
+#define TTPCOMM_ARCHIVE_PROGRESSIVE 8u
+#define TTPCOMM_ARCHIVE_STREAM_REQUIRED 15u
+#define TTPCOMM_ARCHIVE_CACHE_CURRENT 1u
+#pragma pack(push, 8)
+typedef struct TtpCommArchiveStreamOptions {
+    uint32_t size, flags;
+    TtpCommArchiveOptions limits; /* progress/context unused; use canceled. */
+    BOOL (__cdecl *canceled)(void* context);
+    void* context;
+    uint32_t timeout_ms; /* 0: 30000 per wait. */
+} TtpCommArchiveStreamOptions;
+typedef struct TtpCommArchiveStreamStatus {
+    uint32_t size, complete;
+    uint64_t completed_bytes, total_bytes, task_id;
+    HRESULT result; /* E_PENDING until verified; failure is terminal. */
+} TtpCommArchiveStreamStatus;
+typedef struct TtpCommArchiveStreamApi {
+    uint32_t size, abi_version, capabilities, reserved;
+    HRESULT (__cdecl *enumerate)(const wchar_t*, const TtpCommArchiveOptions*,
+                                TtpCommArchiveVisitor, void*);
+    HRESULT (__cdecl *open_member)(const wchar_t*, const wchar_t*,
+                                  const TtpCommArchiveStreamOptions*, IStream**);
+    HRESULT (__cdecl *status)(IStream*, TtpCommArchiveStreamStatus*);
+    void (__cdecl *clear_cache)(void); /* Active streams remain valid. */
+} TtpCommArchiveStreamApi;
+#pragma pack(pop)
+typedef BOOL (__cdecl *TtpCommQueryArchiveStreamFn)(uint32_t, TtpCommArchiveStreamApi*);

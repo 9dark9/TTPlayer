@@ -84,31 +84,19 @@ std::filesystem::path ResolveArchiveCueFile(
         return path.lexically_normal();
     }
 
-    // An explicit virtual member or an absolute filesystem FILE directive is
-    // already complete.  004E323B tests those spellings before it joins a
-    // relative FILE value to the CUE source.
-    ArchiveMemberPath explicit_member;
-    if (ParseArchiveMemberPath(filename, explicit_member))
-        return std::filesystem::path(filename);
-    std::filesystem::path referenced(filename);
-    if (referenced.has_root_name() || filename.find(L"://") !=
-            std::wstring_view::npos) {
-        return referenced;
-    }
-
-    std::wstring member_text = referenced.native();
+    // 004E31EE: a drive prefix, two backslashes or :// after a scheme.
+    // A single rooted slash and relative "other.zip|member" are NOT absolute.
+    const auto scheme=filename.find(L"://");
+    const auto first=filename.empty()?L'\0':towlower(filename.front());
+    const bool absolute=filename.size()>=3 &&
+        (((first>=L'a' && first<=L'z') && filename[1]==L':') ||
+         (filename[0]==L'\\' && filename[1]==L'\\') ||
+         (scheme!=std::wstring_view::npos && scheme>0));
+    if(absolute)return std::filesystem::path(filename);
+    std::wstring member_text(filename);
     std::replace(member_text.begin(), member_text.end(), L'/', L'\\');
-    const bool archive_rooted = !member_text.empty() &&
-        (member_text.front() == L'\\' || member_text.front() == L'/');
-    while (!member_text.empty() &&
-           (member_text.front() == L'\\' || member_text.front() == L'/')) {
-        member_text.erase(member_text.begin());
-    }
-    auto member = archive_rooted
-        ? std::filesystem::path(member_text)
-        : std::filesystem::path(source.member).parent_path() / member_text;
-    if (member.empty() || member.has_root_name() || member.has_root_directory())
-        throw std::runtime_error("invalid archive CUE FILE path");
+    const auto slash=source.member.find_last_of(L'\\');
+    const auto member=(slash==std::wstring::npos ? std::wstring{} : source.member.substr(0,slash+1))+member_text;
 
     // 004E323B builds `archive|cue-directory\\FILE` with string append
     // operations.  It deliberately does not canonicalize `.` or `..` before
@@ -117,7 +105,7 @@ std::filesystem::path ResolveArchiveCueFile(
     // and make a member playable when the original fails to find it.
     std::wstring logical = source.archive.wstring();
     logical.push_back(L'|');
-    logical.append(member.native());
+    logical.append(member);
     return std::filesystem::path(std::move(logical));
 }
 

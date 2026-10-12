@@ -1,6 +1,5 @@
 #include "ttplayer/audio/archive_member.h"
 
-#include "ttplayer/skin/skin_package.h"
 #include <ttpcomm/runtime_client.h>
 
 #include <algorithm>
@@ -8,6 +7,8 @@
 #include <stdexcept>
 #include <exception>
 #include <wrl/client.h>
+#include <atomic>
+#include <memory>
 
 namespace ttplayer::audio {
 namespace {
@@ -55,12 +56,61 @@ std::filesystem::path NormalizeArchiveMember(std::wstring_view value) {
     return path;
 }
 
-TtpCommArchiveApi ArchiveApi(HMODULE module) {
-    TtpCommArchiveApi api{};
+TtpCommArchiveStreamApi ArchiveApi(HMODULE module) {
+    TtpCommArchiveStreamApi api{};
     if(module) {
-        if(ttpcomm::host::QueryArchive(module,api)) return api;
-    } else if(const auto* loaded=ttpcomm::host::Archive()) return *loaded;
+        if(ttpcomm::host::QueryArchiveStreams(module,api)) return api;
+    } else if(const auto* loaded=ttpcomm::host::ArchiveStreams()) return *loaded;
     throw ArchiveError(HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH));
+}
+
+// Decoder clones must retain their cancellation context too. The DLL producer
+// never owns a callback into a destroyed AudioEngine or metadata worker.
+class OwnedArchiveStream final : public IStream {
+    std::atomic<ULONG> references_{1};
+    std::shared_ptr<std::function<bool()>> canceled_;
+    Microsoft::WRL::ComPtr<IStream> inner_;
+public:
+    OwnedArchiveStream(std::shared_ptr<std::function<bool()>> canceled,IStream* stream)
+        : canceled_(std::move(canceled)) {inner_.Attach(stream);}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** out) override {
+        if(!out)return E_POINTER;*out=nullptr;
+        if(id==IID_IUnknown || id==IID_IStream || id==IID_ISequentialStream){*out=static_cast<IStream*>(this);AddRef();return S_OK;}
+        return inner_->QueryInterface(id,out);
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override{return ++references_;}
+    ULONG STDMETHODCALLTYPE Release() override{const auto n=--references_;if(!n)delete this;return n;}
+    HRESULT STDMETHODCALLTYPE Read(void* p,ULONG n,ULONG* r) override{return inner_->Read(p,n,r);}
+    HRESULT STDMETHODCALLTYPE Write(const void* p,ULONG n,ULONG* r) override{return inner_->Write(p,n,r);}
+    HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER p,DWORD w,ULARGE_INTEGER* r) override{return inner_->Seek(p,w,r);}
+    HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER n) override{return inner_->SetSize(n);}
+    HRESULT STDMETHODCALLTYPE CopyTo(IStream* s,ULARGE_INTEGER n,ULARGE_INTEGER* r,ULARGE_INTEGER* w) override{return inner_->CopyTo(s,n,r,w);}
+    HRESULT STDMETHODCALLTYPE Commit(DWORD f) override{return inner_->Commit(f);}
+    HRESULT STDMETHODCALLTYPE Revert() override{return inner_->Revert();}
+    HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER a,ULARGE_INTEGER b,DWORD c) override{return inner_->LockRegion(a,b,c);}
+    HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER a,ULARGE_INTEGER b,DWORD c) override{return inner_->UnlockRegion(a,b,c);}
+    HRESULT STDMETHODCALLTYPE Stat(STATSTG* s,DWORD f) override{return inner_->Stat(s,f);}
+    HRESULT STDMETHODCALLTYPE Clone(IStream** out) override {
+        if(!out)return E_POINTER;*out=nullptr;Microsoft::WRL::ComPtr<IStream> clone;
+        const auto hr=inner_->Clone(&clone);if(FAILED(hr))return hr;
+        try{*out=new OwnedArchiveStream(canceled_,clone.Get());clone.Detach();return S_OK;}catch(...){return E_OUTOFMEMORY;}
+    }
+};
+IStream* OpenMember(const ArchiveMemberPath& path,HMODULE module,
+                    const std::function<bool()>& canceled,bool cache,uint64_t limit) {
+    const auto api=ArchiveApi(module);
+    auto control=std::make_shared<std::function<bool()>>(canceled);
+    TtpCommArchiveStreamOptions options{};options.size=sizeof(options);
+    options.flags=cache?TTPCOMM_ARCHIVE_CACHE_CURRENT:0;
+    options.limits.size=sizeof(options.limits);options.limits.member_limit_bytes=limit;
+    options.context=control.get();options.canceled=[](void* context)->BOOL {
+        const auto& fn=*static_cast<std::function<bool()>*>(context);return fn && fn();
+    };
+    Microsoft::WRL::ComPtr<IStream> stream;
+    const auto hr=api.open_member(path.archive.c_str(),path.member.c_str(),&options,&stream);
+    if(FAILED(hr))throw ArchiveError(hr);
+    if(!stream)throw ArchiveError(E_UNEXPECTED);
+    auto* result=new OwnedArchiveStream(std::move(control),stream.Get());stream.Detach();return result;
 }
 
 } // namespace
@@ -123,15 +173,7 @@ std::wstring DecodeZipMemberName(std::string_view encoded_name) {
 
 std::vector<unsigned char> ReadZipMember(const ZipMemberPath& path,
                                          HMODULE ttpcomm) {
-    const auto package = skin::SkinPackage::Open(path.archive);
-    std::wstring requested = path.member;
-    std::replace(requested.begin(), requested.end(), L'/', L'\\');
-    for (const auto& entry : package.Entries()) {
-        const auto decoded = DecodeZipMemberName(entry.name);
-        if (_wcsicmp(decoded.c_str(), requested.c_str()) == 0)
-            return package.ReadEntry(entry.name, ttpcomm);
-    }
-    throw std::runtime_error("ZIP member not found");
+    return ReadArchiveMember({path.archive,path.member,ArchiveKind::zip},ttpcomm);
 }
 
 bool ParseArchiveMemberPath(std::wstring_view logical_path,
@@ -162,50 +204,41 @@ std::filesystem::path MakeArchiveMemberPath(
     return std::filesystem::path(std::move(logical));
 }
 
-IStream* OpenArchiveMemberStream(const ArchiveMemberPath& path, HMODULE ttpcomm) {
-    IStream* stream{};
-    if(path.kind==ArchiveKind::rar) {
-        const auto api=ArchiveApi(ttpcomm);
-        const HRESULT result=api.open_member(path.archive.c_str(),path.member.c_str(),nullptr,&stream);
-        if(FAILED(result)) throw ArchiveError(result);
-        if(!stream) throw ArchiveError(E_UNEXPECTED);
-        return stream;
-    }
-    const auto bytes=ReadZipMember({path.archive,path.member},ttpcomm);
-    if(bytes.size()>ULONG_MAX) throw ArchiveError(HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE));
-    HRESULT result=CreateStreamOnHGlobal(nullptr,TRUE,&stream);
-    if(FAILED(result)) throw ArchiveError(result);
-    Microsoft::WRL::ComPtr<IStream> owner; owner.Attach(stream);
-    ULONG written{};
-    result=stream->Write(bytes.data(),static_cast<ULONG>(bytes.size()),&written);
-    if(FAILED(result) || written!=bytes.size()) throw ArchiveError(FAILED(result) ? result : STG_E_WRITEFAULT);
-    LARGE_INTEGER zero{};
-    result=stream->Seek(zero,STREAM_SEEK_SET,nullptr);
-    if(FAILED(result)) throw ArchiveError(result);
-    return owner.Detach();
+IStream* OpenArchiveMemberStream(const ArchiveMemberPath& path, HMODULE ttpcomm,
+                                 const std::function<bool()>& canceled) {
+    return OpenMember(path,ttpcomm,canceled,true,0);
 }
 
-std::vector<unsigned char> ReadArchiveMember(const ArchiveMemberPath& path, HMODULE ttpcomm) {
-    // This buffered adapter is for CUE/text consumers. Audio readers use the
-    // seekable member stream directly, including its bounded disk backing.
-    if(path.kind==ArchiveKind::zip) return ReadZipMember({path.archive,path.member},ttpcomm);
-    const auto api=ArchiveApi(ttpcomm);
-    TtpCommArchiveOptions options{}; options.size=sizeof(options);
-    options.member_limit_bytes=64ULL*1024*1024;
+std::vector<unsigned char> ReadArchiveMember(const ArchiveMemberPath& path, HMODULE ttpcomm,
+                                             const std::function<bool()>& canceled) {
+    // Text reads must not evict the shared backing audio of adjacent CUE rows.
+    constexpr uint64_t limit=16ULL*1024*1024;
     Microsoft::WRL::ComPtr<IStream> stream;
-    HRESULT result=api.open_member(path.archive.c_str(),path.member.c_str(),&options,stream.GetAddressOf());
+    stream.Attach(OpenMember(path,ttpcomm,canceled,false,limit));
+    STATSTG stat{}; HRESULT result=stream->Stat(&stat,STATFLAG_NONAME);
     if(FAILED(result)) throw ArchiveError(result);
-    if(!stream) throw ArchiveError(E_UNEXPECTED);
-    STATSTG stat{}; result=stream->Stat(&stat,STATFLAG_NONAME);
-    if(FAILED(result)) throw ArchiveError(result);
-    if(stat.cbSize.QuadPart>options.member_limit_bytes) throw ArchiveError(HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE));
+    if(stat.cbSize.QuadPart>limit) throw ArchiveError(HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE));
     std::vector<unsigned char> bytes(static_cast<size_t>(stat.cbSize.QuadPart));
     ULONG read{}; result=stream->Read(bytes.data(),static_cast<ULONG>(bytes.size()),&read);
     if(FAILED(result) || read!=bytes.size()) throw ArchiveError(FAILED(result) ? result : STG_E_READFAULT);
+    unsigned char end{};result=stream->Read(&end,1,&read); // Empty members also require final verification.
+    if(FAILED(result) || read)throw ArchiveError(FAILED(result)?result:STG_E_READFAULT);
     return bytes;
 }
 
-std::vector<std::wstring> ListRarArchiveMembers(const std::filesystem::path& archive, HMODULE ttpcomm) {
+int ArchiveMemberProgress(IStream* stream,HMODULE ttpcomm,HRESULT* result) {
+    if(result)*result=S_OK;if(!stream)return -1;
+    try {
+        TtpCommArchiveStreamStatus status{};status.size=sizeof(status);
+        const auto hr=ArchiveApi(ttpcomm).status(stream,&status);
+        if(FAILED(hr)){if(result)*result=hr;return -1;}
+        if(result && status.complete)*result=status.result;
+        if(status.complete)return SUCCEEDED(status.result)?100:-1;
+        return status.total_bytes?static_cast<int>(std::min<uint64_t>(99,status.completed_bytes*100/status.total_bytes)):0;
+    }catch(const ArchiveError& error){if(result)*result=error.Result();return -1;}
+}
+
+std::vector<std::wstring> ListArchiveMembers(const std::filesystem::path& archive, HMODULE ttpcomm) {
     struct Context { std::vector<std::wstring> names; std::exception_ptr error; } context;
     const auto visitor=[](void* opaque,const TtpCommArchiveEntry* entry)->BOOL {
         auto& out=*static_cast<Context*>(opaque);
@@ -220,6 +253,10 @@ std::vector<std::wstring> ListRarArchiveMembers(const std::filesystem::path& arc
     if(FAILED(result)) throw ArchiveError(result);
     // 00473338 and 00474051 retain the archive's order. Never alphabetize here.
     return std::move(context.names);
+}
+
+std::vector<std::wstring> ListRarArchiveMembers(const std::filesystem::path& archive, HMODULE ttpcomm) {
+    return ListArchiveMembers(archive,ttpcomm);
 }
 
 } // namespace ttplayer::audio
