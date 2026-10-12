@@ -2784,6 +2784,7 @@ bool PlayerWindow::Create(HINSTANCE instance, int show_command) {
         external_skin_.reset();
         UpdateMainToolRects();UpdatePlaylistToolRects();UpdateEqualizerToolRects();
     }
+    ResetSkinInfoScroll();
     if (external_skin_) ApplyAutoLyricWidth();
     RemovePluginSkinNativeTips();
     ApplyWindowShadow();
@@ -4436,6 +4437,10 @@ bool PlayerWindow::HandleMainSkinSliderMessage(UINT message, WPARAM wparam, LPAR
 }
 
 void PlayerWindow::PaintSkin(HDC dc, const std::vector<std::wstring>* repaint) const {
+    // Partial/native paint callers must obey the same surface ownership as
+    // Paint(). In particular, info animation uses a window DC outside WM_PAINT.
+    if (skin_rebinding_) return;
+    if (external_skin_) { external_skin_->Paint(window_, dc); return; }
     if (!skin_) return;
     const SIZE size = ActiveSkinSize();
     const HDC canvas = CreateCompatibleDC(dc);
@@ -7266,7 +7271,7 @@ void PlayerWindow::StartSkinInfoItem() {
     info_scroll_direction_ = 0;
     info_scroll_hold_ticks_ = 0;
     info_vertical_offset_ = 0;
-    if (!skin_ || info_items_.empty() || !playback_error_text_.empty()) return;
+    if (external_skin_ || !skin_ || info_items_.empty() || !playback_error_text_.empty()) return;
     if (info_item_index_ >= info_items_.size()) info_item_index_ = 0;
     const auto* info = FindActiveSkinElement(L"info");
     if (!info) return;
@@ -7303,6 +7308,9 @@ void PlayerWindow::StartSkinInfoItem() {
 }
 
 void PlayerWindow::AdvanceSkinInfoScroll(UINT_PTR timer) {
+    // Kill all native info timers, including a transition that could otherwise
+    // be rearmed by a WM_TIMER already queued before the provider took over.
+    if (external_skin_) { ResetSkinInfoScroll(); return; }
     if (!window_ || !skin_ || info_items_.empty() || !playback_error_text_.empty()) {
         if (window_) KillTimer(window_, timer);
         if (info_timer_ == timer) info_timer_ = 0;
@@ -7373,6 +7381,7 @@ void PlayerWindow::AdvanceSkinInfoScroll(UINT_PTR timer) {
 }
 
 void PlayerWindow::PaintSkinInfoTick() {
+    if (external_skin_ || skin_rebinding_) return;
     const auto* info = FindActiveSkinElement(L"info");
     if (!window_ || !info || info_items_.empty() || info_item_index_ >= info_items_.size()) return;
     const HDC dc = GetDC(window_);

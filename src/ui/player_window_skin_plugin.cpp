@@ -154,6 +154,7 @@ bool PlayerWindow::LoadPluginSkin(const std::filesystem::path& path, bool restor
             RemovePluginSkinNativeTips();return false;
         }
         external_skin_=std::move(next);
+        ResetSkinInfoScroll();
         RebuildLyricFont(false);
         UpdateLyricEditorStyle();LayoutLyricEditor();
         UpdateVisualWindowLayout();UpdateVisualFrame();
